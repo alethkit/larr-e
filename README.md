@@ -132,6 +132,12 @@ larr-e query "plot the last 10 minutes of OD against temperature"
 
 ## 3. Usage
 
+**Start everything with one command.** `./up.sh` opens one tmux window with four panes (listener, API, 3DS
+bridge, Slack bot), loads `real.env` and `~/.config/larr-e/secrets.env` in each, and restarts cleanly if it's
+already running. Use `./up.sh rehearsal` for the local test setup, and `./down.sh` to stop. In tmux,
+click a pane to focus it, `Ctrl-b z` zooms it, and `Ctrl-b d` detaches while everything keeps running
+(`tmux attach -t larre` to come back).
+
 ```bash
 larr-e status                                       # live table, no LLM call
 larr-e query "plot the last 10 minutes of OD against temperature"

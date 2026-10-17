@@ -1,7 +1,7 @@
 import { Show } from "solid-js";
 import { AuxiliarySurface, Text, View } from "@pocketjs/framework/components";
 import { ClassicButton } from "@pocketjs/framework/classic";
-import { ANSWER_LINES, MAX_UNITS, SPARK_BARS, SPARK_HEIGHT } from "../shared/protocol.ts";
+import { ANSWER_LINES, CHART_BARS, MAX_UNITS, SPARK_HEIGHT } from "../shared/protocol.ts";
 import { createLarre, type Larre } from "./store.ts";
 
 const range = (n: number) => Array.from({ length: n }, (_, i) => i);
@@ -17,10 +17,17 @@ function Dashboard(p: { s: Larre }) {
       {s.snap()?.units[i]?.text ?? (i === 0 ? s.snap()?.note || "Waiting for telemetry..." : "")}
     </Text>
   ));
-  const bars = range(SPARK_BARS).map(i => {
-    const h = () => s.snap()?.spark[i] ?? 0;
-    return <View class="absolute w-[7] bg-[#2dd4bf]" style={{ insetL: 20 + i * 9, insetT: 125 + SPARK_HEIGHT - h(), height: h() }} />;
-  });
+  // Two charts side by side: temperature (left, orange) and stirring (right, teal).
+  const CHARTS = [{ left: 8, color: "#fb923c" }, { left: 204, color: "#2dd4bf" }];
+  const chartLabels = CHARTS.map((c, k) => (
+    <Text class="absolute top-[111] text-xs" style={{ insetL: c.left, textColor: 0xffb8a394 }}>
+      {s.snap()?.charts[k]?.label ?? (k === 0 ? "Temp" : "Stir")}
+    </Text>
+  ));
+  const bars = CHARTS.flatMap((c, k) => range(CHART_BARS).map(i => {
+    const h = () => s.snap()?.charts[k]?.bars[i] ?? 0;
+    return <View class="absolute w-[7]" style={{ bgColor: c.color, insetL: c.left + i * 9, insetT: 125 + SPARK_HEIGHT - h(), height: h() }} />;
+  }));
   const lines = range(ANSWER_LINES).map(i => (
     <Text class="absolute left-[8] text-xs" style={{ insetT: 160 + i * 15, textColor: 0xfff1f4e6 }}>{s.answer()[i] ?? ""}</Text>
   ));
@@ -39,7 +46,7 @@ function Dashboard(p: { s: Larre }) {
       </View>}
     </Show>
     {units}
-    <Text class="absolute left-[8] top-[111] text-xs" style={{ textColor: 0xffb8a394 }}>{s.snap()?.sparkLabel ?? "OD, last 30 min"}</Text>
+    {chartLabels}
     {bars}
     <View class="absolute left-[4] right-[4] top-[157] h-[1]" style={{ bgColor: "#1f4d47" }} />
     {lines}

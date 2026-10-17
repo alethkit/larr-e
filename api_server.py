@@ -315,7 +315,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and not parts:
                 self._send(200, DASHBOARD_PATH.read_bytes(), "text/html; charset=utf-8")
             elif method == "GET" and parts == ["api", "status"]:
-                self._json(200, svc.tools.get_live_status())
+                self._json(200, svc.tools.get_live_status(include_history=q("history") == "1"))
             elif method == "GET" and parts == ["api", "alerts"]:
                 self._json(200, svc.recent_alerts(min(int(q("n", 5)), 50)))
             elif method == "GET" and parts == ["api", "series"]:

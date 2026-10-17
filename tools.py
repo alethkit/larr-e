@@ -59,6 +59,15 @@ METRIC_TABLES: dict[str, tuple[str, str, str]] = {
     "stirring": ("stirring_rates", "measured_rpm", ""),
 }
 
+# The leader's live time-series API (/api/experiments/<exp>/time_series/<source>) covers these
+# metrics; stirring isn't served there, so it comes from the listener's recent history instead.
+LEADER_SERIES = {
+    "od": "od_readings",
+    "od_filtered": "od_readings_filtered",
+    "temperature": "temperature_readings",
+    "growth_rate": "growth_rates",
+}
+
 METRIC_LABELS = {
     "od": "OD (raw)",
     "od_filtered": "OD (normalized)",
@@ -375,15 +384,57 @@ class PioreactorTools:
     def get_series(
         self, metric: str, unit: str, minutes: float, experiment: str | None = None
     ) -> tuple[Series, str]:
-        """Fetch a time series covering the most recent `minutes` of data.
+        """Fetch a time series covering the most recent `minutes` of data, from the first source
+        that has it: the leader's live API, then a local copy of its database, then the
+        listener's recent history.
 
-        The window is anchored on the newest stored reading rather than the wall
-        clock: Raspberry Pis have no RTC, so clocks can disagree across machines.
+        For the database, the window is anchored on the newest stored reading rather than the
+        wall clock: Raspberry Pis have no RTC, so clocks can disagree across machines.
         """
         if metric not in METRIC_TABLES:
             raise ToolError(f"metric must be one of {sorted(METRIC_TABLES)}")
-        table, column, extra = METRIC_TABLES[metric]
         experiment = experiment or self.resolve_experiment(unit)
+        attempts: list[str] = []
+        if self.cfg.pioreactor.pump_transport == "http" and metric in LEADER_SERIES:
+            try:
+                series = self._leader_series(metric, unit, minutes, experiment)
+                if series.values:
+                    return series, series.timestamps[-1].isoformat()
+                attempts.append("leader API: no readings in that window")
+            except ToolError as exc:
+                attempts.append(str(exc))
+        if Path(self.cfg.pioreactor.db_path).exists():
+            series, latest = self._db_series(metric, unit, minutes, experiment)
+            if series.values:
+                return series, latest
+            attempts.append("database copy: no readings")
+        series = self._live_series(metric, unit, minutes, experiment)
+        if series.values:
+            return series, series.timestamps[-1].isoformat()
+        attempts.append("listener: no recent readings (is the job running and `larr-e listen` up?)")
+        return Series(metric, unit, experiment, [], []), "no data (" + "; ".join(attempts) + ")"
+
+    def _leader_series(self, metric: str, unit: str, minutes: float, experiment: str) -> Series:
+        path = (f"/api/experiments/{urllib.parse.quote(experiment)}/time_series/{LEADER_SERIES[metric]}"
+                f"?lookback={minutes / 60:.4f}")  # lookback is in hours
+        data = self._http_json("GET", path)
+        names, points = data.get("series", []), data.get("data", [])
+        rows = points[names.index(unit)] if unit in names and names.index(unit) < len(points) else []
+        rows = sorted(rows, key=lambda p: p["x"])
+        return Series(metric, unit, experiment, [parse_timestamp(p["x"]) for p in rows], [float(p["y"]) for p in rows])
+
+    def _live_series(self, metric: str, unit: str, minutes: float, experiment: str) -> Series:
+        s = self._live_state().get(unit, {})
+        values, stamps = s.get("history", {}).get(metric, []), s.get("history_t", {}).get(metric, [])
+        pairs = list(zip(stamps, values))
+        if pairs:
+            cutoff = pairs[-1][0] - minutes * 60  # anchored on the newest reading, like the database path
+            pairs = [(t, v) for t, v in pairs if t >= cutoff]
+        return Series(metric, unit, experiment,
+                      [datetime.fromtimestamp(t, timezone.utc) for t, _ in pairs], [float(v) for _, v in pairs])
+
+    def _db_series(self, metric: str, unit: str, minutes: float, experiment: str) -> tuple[Series, str]:
+        table, column, extra = METRIC_TABLES[metric]
         try:
             with self._connect_ro() as conn:
                 latest = conn.execute(
@@ -500,8 +551,21 @@ class PioreactorTools:
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
 
-    def get_live_status(self, unit: str | None = None) -> dict[str, Any]:
+    def get_live_status(self, unit: str | None = None, include_history: bool = False) -> dict[str, Any]:
         state = self._live_state()
+        if not include_history:  # charts only; keep it out of the agent's context
+            state = {u: {k: v for k, v in s.items() if k not in ("history", "history_t")} for u, s in state.items()}
+        now = datetime.now(timezone.utc)
+        for s in state.values():  # say how old the data is, so a stopped job isn't reported as live
+            try:
+                age = round((now - parse_timestamp(s["last_seen"])).total_seconds())
+            except (KeyError, ValueError):
+                continue
+            s["seconds_since_last_reading"] = age
+            if age > 120:  # spelled out in the data: weaker models skip instructions more than facts
+                s["stale"] = True
+                s["note"] = (f"STALE: the newest reading is {age // 60} min old. The jobs that publish these "
+                             "readings are probably stopped; these values are NOT current.")
         if not state:
             return {"available": False, "note": "listener.py is not running or has seen no telemetry yet."}
         if unit:

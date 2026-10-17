@@ -133,6 +133,8 @@ class LLMConfig:
     hf_model: str = _env("LARRE_HF_MODEL", "openai/gpt-oss-120b:fastest")
     hf_base_url: str = _env("LARRE_HF_BASE_URL", "https://router.huggingface.co/v1")
     hf_max_tokens: int = _env_int("LARRE_HF_MAX_TOKENS", 8192)
+    # Bill a Hugging Face organization (e.g. a hackathon org holding the credits) instead of yourself.
+    hf_bill_to: str | None = _env("LARRE_HF_BILL_TO")
     # Gemini backend (OpenAI-compatible endpoint). Check your free-tier models at aistudio.google.com/rate-limit.
     gemini_model: str = _env("LARRE_GEMINI_MODEL", "gemini-3.8-flash")
     gemini_base_url: str = _env("LARRE_GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
@@ -145,6 +147,10 @@ class OutputConfig:
     runtime_dir: Path = RUNTIME_DIR
     state_path: Path = RUNTIME_DIR / "live_state.json"
     alerts_path: Path = RUNTIME_DIR / "alerts.jsonl"
+    # Recent readings kept per unit/metric in the live state (for the 3DS charts): at most
+    # history_points samples, at least history_step_s apart.
+    history_points: int = _env_int("LARRE_HISTORY_POINTS", 40)
+    history_step_s: float = _env_float("LARRE_HISTORY_STEP_S", 5.0)
     audit_path: Path = RUNTIME_DIR / "audit.jsonl"  # who requested and who approved each hardware action
     plots_dir: Path = RUNTIME_DIR / "plots"
     # Webhook posting from listener.py. Leave unset when slack_bot.py is running,

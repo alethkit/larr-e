@@ -24,6 +24,7 @@ import hmac
 import json
 import logging
 import secrets
+import textwrap
 import threading
 import time
 import uuid
@@ -93,12 +94,87 @@ PRESET_LIBRARY: dict[str, dict[str, str]] = {
         "prompt": "Heat the default unit to 32 C: start the temperature automation (thermostat) with "
         "target_temperature 32. If it is already running, set its target temperature to 32 instead.",
     },
+    "pump": {
+        "label": "Pump media 2 s",
+        "mode": "exec",
+        "prompt": "Run the media pump on the default unit for 2 seconds (dose with pump=media, duration_s=2).",
+    },
+    "exchange": {
+        "label": "Swap media 2 s",
+        "mode": "exec",
+        "prompt": "Exchange media on the default unit: run the media pump for 2 seconds (dose pump=media, "
+        "duration_s=2), then the waste pump for 2 seconds (dose pump=waste, duration_s=2).",
+    },
     "stop": {
         "label": "Stop stir + heat",
         "mode": "exec",
         "prompt": "Stop the stirring job and the temperature automation on the default unit.",
     },
 }
+
+
+# ---------------------------------------------------------------- plain-text screen (native 3DS app)
+
+ALERT_MAX_AGE_S = 600  # older alerts are history, not news
+TOOL_TITLES = {
+    "dose": "Run a pump",
+    "set_target_temperature": "Change temperature",
+    "set_stirring_rpm": "Change stirring",
+    "start_job": "Start a job",
+    "stop_job": "Stop a job",
+    "start_experiment": "Start experiment",
+    "stop_experiment": "Stop experiment",
+}
+_ASCII = {"°": "", "→": "->", "←": "<-", "µ": "u", "–": "-", "—": "-", "’": "'", "‘": "'", "“": '"', "”": '"', "…": "..."}
+
+
+def _ascii(text: str) -> str:
+    text = "".join(_ASCII.get(c, c) for c in str(text))
+    return text.encode("ascii", "replace").decode()
+
+
+def _wrap(text: str, cols: int, max_lines: int) -> list[str]:
+    lines = [w for para in _ascii(text).splitlines() for w in (textwrap.wrap(para, cols) or [""])]
+    return lines[:max_lines]
+
+
+def screen_lines(status: dict[str, Any], alerts: dict[str, Any], approvals: list[dict[str, Any]],
+                 cols: int = 40) -> list[str]:
+    """What the native 3DS app shows, as tagged ASCII lines it can print without parsing JSON.
+
+    U unit row, N note, C/A alert title (critical/other), a alert text, P "<id> <title>" of the
+    first pending approval, p its arguments. The app only splits lines on the tag.
+    """
+    def num(entry: Any, fmt: str) -> str:
+        return format(entry["value"], fmt) if isinstance(entry, dict) and isinstance(entry.get("value"), (int, float)) else "-"
+
+    lines: list[str] = []
+    units = {k: v for k, v in status.items() if k not in ("available", "note") and isinstance(v, dict)}
+    if status.get("available") and units:
+        for name in sorted(units):
+            u = units[name]
+            od = (u.get("od") or {}).get("od1") or (u.get("od") or {}).get("od2")
+            row = (f"{name[:6]:<6} OD {num(od, '.3f'):>5} {num(u.get('temperature'), '.1f'):>4}C "
+                   f"{num(u.get('growth_rate'), '.2f'):>4}/h {num(u.get('stirring'), '.0f'):>4}rpm")
+            if u.get("stale"):
+                row += " old"
+            lines.append("U " + _ascii(row)[:cols])
+    else:
+        lines.append("N " + _ascii(status.get("note") or "No telemetry yet")[:cols])
+
+    last = (alerts.get("alerts") or [None])[-1]
+    if last and last.get("age_s") is not None and last["age_s"] <= ALERT_MAX_AGE_S:
+        tag = "C" if last.get("severity") == "critical" else "A"
+        title = f"{str(last.get('severity', '')).upper()} {last.get('unit', '')} {last.get('metric', '')}"
+        lines.append(f"{tag} " + _ascii(title)[:cols])
+        lines += ["a " + line for line in _wrap(last.get("message", ""), cols, 2)]
+
+    if approvals:
+        a = approvals[0]
+        lines.append(f"P {a['id']} " + _ascii(TOOL_TITLES.get(a["tool"], a["tool"]))[:cols])
+        args = "\n".join(f"{k} = {v}" for k, v in a.get("args", {}).items() if v is not None)
+        lines += ["p " + line for line in _wrap(args, cols, 4)]
+    return lines
 
 
 @dataclass
@@ -321,7 +397,12 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and not parts:
                 self._send(200, DASHBOARD_PATH.read_bytes(), "text/html; charset=utf-8")
             elif method == "GET" and parts == ["api", "status"]:
-                self._json(200, svc.tools.get_live_status())
+                self._json(200, svc.tools.get_live_status(include_history=q("history") == "1"))
+            elif method == "GET" and parts == ["api", "screen"]:
+                cols = max(20, min(int(q("cols", 40)), 80))
+                text = "\n".join(screen_lines(svc.tools.get_live_status(), svc.recent_alerts(1),
+                                               svc.pending_approvals(), cols))
+                self._send(200, (text + "\n").encode("ascii"), "text/plain; charset=us-ascii")
             elif method == "GET" and parts == ["api", "alerts"]:
                 self._json(200, svc.recent_alerts(min(int(q("n", 5)), 50)))
             elif method == "GET" and parts == ["api", "series"]:

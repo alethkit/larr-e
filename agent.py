@@ -67,6 +67,8 @@ Rules:
 - If a request is ambiguous in a way that matters for hardware (which unit, how much), ask instead of guessing.
 - If the user declines a confirmation, stop and say nothing was changed.
 - Never state a reading you have not fetched with a tool in this conversation.
+- Live readings marked stale (see seconds_since_last_reading and age_s) are old: the job that
+  publishes them has probably stopped. Say so instead of presenting them as current.
 - Reply in a few short lines suitable for a terminal or Slack message: what you did or found, with numbers.
 """
 
@@ -197,7 +199,8 @@ ACTION_TOOLS = [
     ),
     _tool(
         "dose",
-        "Run a peristaltic pump once. Give exactly one of ml or duration_s.",
+        "Run a peristaltic pump once. Give exactly one of ml or duration_s. Uncalibrated pumps "
+        "accept only duration_s (the tool says so if you try ml).",
         {
             "pump": {"type": "string", "enum": sorted(PUMP_JOBS)},
             "unit": UNIT,

@@ -7,22 +7,25 @@ export const TOP_COLS = 56;
 /** Columns for the 320px bottom screen. */
 export const BOTTOM_COLS = 44;
 export const ANSWER_LINES = 5;
-export const SPARK_BARS = 40;
+export const CHART_BARS = 20; // per chart; two charts side by side on the top screen
 export const SPARK_HEIGHT = 28;
+export const CHART_LABEL_CHARS = 27;
 export const MAX_UNITS = 3;
+export const MAX_PRESETS = 6; // touch buttons on the bottom screen, 2 per row
 
 export type UnitRow = { text: string; alarm: boolean };
 export type AlertInfo = { title: string; critical: boolean; lines: string[] };
 export type ApprovalInfo = { id: string; title: string; lines: string[] };
 export type Preset = { name: string; label: string; exec: boolean };
+/** One mini bar chart: newest reading on the right; 0-height bars are empty slots. */
+export type ChartInfo = { label: string; bars: number[] };
 
 export type Snapshot = {
   units: UnitRow[];
   note: string; // shown when there are no units, e.g. "listener not running"
   alert: AlertInfo | null;
   approval: ApprovalInfo | null;
-  spark: number[]; // bar heights, 0..SPARK_HEIGHT
-  sparkLabel: string;
+  charts: [ChartInfo, ChartInfo]; // temperature, stirring
   presets: Preset[];
 };
 

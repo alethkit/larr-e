@@ -10,6 +10,7 @@ Endpoints used (checked against Pioreactor 26.11 source, core/pioreactor/web/api
     POST /api/experiment_profiles                      {"filename", "body"}
     GET  /api/experiments/<exp>/experiment_profiles/running
     GET  /api/workers/<unit>/experiment                 the experiment the unit is assigned to
+    GET  /api/workers/<unit>/jobs/running               {unit: {"ok", "value": [{"job_name", "is_running"}, ...]}}
     POST /unit_api/jobs/stop                           {"job_id": ...}  (core/pioreactor/web/unit_api.py)
 """
 
@@ -96,6 +97,15 @@ class LeaderAPI:
     def stop_job(self, unit: str, job: str, experiment: str) -> Any:
         path = f"/api/workers/{quote(unit, safe='')}/jobs/stop/job_name/{quote(job, safe='')}/experiments/{quote(experiment, safe='')}"
         return self.call("POST", path, {})
+
+    def running_jobs(self, unit: str) -> set[str]:
+        """Names of the jobs running on a unit."""
+        result = self.call("GET", f"/api/workers/{quote(unit, safe='')}/jobs/running")
+        entry = result.get(unit) if isinstance(result, dict) else None
+        jobs = entry.get("value") if isinstance(entry, dict) else None
+        if not isinstance(jobs, list):
+            raise LeaderAPIError(f"Unexpected running-jobs reply for {unit}: {str(result)[:200]}")
+        return {j["job_name"] for j in jobs if isinstance(j, dict) and j.get("is_running")}
 
     def assigned_experiment(self, unit: str) -> str | None:
         """The experiment the leader has this worker assigned to; None if unknown or unreachable.

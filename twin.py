@@ -564,15 +564,20 @@ def make_handler(twin: Twin):
             if verb == "stop":
                 if job == "experiment_profile":
                     return self._reply(202, twin.task(lambda: {"killed": twin.kill_profiles(exp)}))
-                return self._reply(202, twin.task(lambda: {"stopped": twin.stop_job(unit, job)}))
+                return self._reply(202, twin.task(lambda: per_unit(unit, {"stopped": twin.stop_job(unit, job)})))
             args, options = body.get("args") or [], body.get("options") or {}
             if job == "experiment_profile":
                 if len(args) < 3 or args[0] != "execute":
                     return self._reply(400, {"error": "expected args ['execute', <path>, <experiment>]"})
                 return self._reply(202, twin.task(lambda: twin.run_profile(unit, args[1], args[2], "dry-run" in options)))
-            return self._reply(202, twin.task(lambda: twin.start_job(unit, job, options)))
+            return self._reply(202, twin.task(lambda: per_unit(unit, twin.start_job(unit, job, options))))
 
     return Handler
+
+
+def per_unit(unit: str, value: Any) -> dict[str, Any]:
+    """Pioreactor 26.11 reduces a job run/stop across units to {unit: {"ok", "unit", "value"}} (web/tasks.py)."""
+    return {unit: {"ok": True, "unit": unit, "value": value}}
 
 
 def serve(twin: Twin, host: str, port: int) -> ThreadingHTTPServer:

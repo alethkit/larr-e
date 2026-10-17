@@ -30,7 +30,7 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 py-modules = [
     "agent", "api_server", "config", "experiment", "inject_anomaly", "leader_api",
-    "listener", "schema", "slack_bot", "tools", "twin",
+    "listener", "openai_compat", "schema", "slack_bot", "tools", "twin",
 ]
 
 [tool.pytest.ini_options]

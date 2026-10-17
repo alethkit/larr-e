@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { encode, shape, toAscii, wrap } from "../bridge/format.ts";
-import { sparkBars, unitRow } from "../bridge/larre.ts";
-import { SPARK_BARS, SPARK_HEIGHT, TOP_COLS } from "../shared/protocol.ts";
+import { chartFor, sparkBars, unitRow } from "../bridge/larre.ts";
+import { CHART_BARS, CHART_LABEL_CHARS, SPARK_HEIGHT, TOP_COLS } from "../shared/protocol.ts";
 
 test("toAscii keeps meaning for lab symbols and drops the rest", () => {
   expect(toAscii("30.1 °C, µ = −0.4 h⁻¹ → crash… “ok” café 🧫")).toBe('30.1 C, u = -0.4 h^-1 -> crash... "ok" cafe ');
@@ -35,11 +35,21 @@ test("unit rows fit the top screen and flag alarms", () => {
   expect(unitRow("w1", {}).text).toContain("OD     -");
 });
 
-test("spark bars resample to a fixed count within the height", () => {
-  const bars = sparkBars([1, 2, 3]);
-  expect(bars.length).toBe(SPARK_BARS);
-  expect(Math.max(...bars)).toBe(SPARK_HEIGHT);
-  expect(Math.min(...bars)).toBe(2);
+test("chart bars: short series right-aligned, long series averaged, flat series mid-height", () => {
+  const short = sparkBars([1, 2, 3]);
+  expect(short.length).toBe(CHART_BARS);
+  expect(short.slice(0, CHART_BARS - 3).every(h => h === 0)).toBe(true); // empty slots on the left
+  expect(short.slice(-3)).toEqual([2, Math.round(2 + (SPARK_HEIGHT - 2) / 2), SPARK_HEIGHT]);
+  const long = sparkBars(Array.from({ length: 40 }, (_, i) => i));
+  expect(long.length).toBe(CHART_BARS);
+  expect(long[0]).toBe(2); expect(long.at(-1)).toBe(SPARK_HEIGHT);
+  expect(new Set(sparkBars([500, 500, 500]).slice(-3))).toEqual(new Set([Math.round(SPARK_HEIGHT / 2)]));
   expect(sparkBars([])).toEqual([]);
-  expect(new Set(sparkBars([5, 5, 5])).size).toBe(1);
+});
+
+test("chart labels show unit, latest value and range, and fit their panel", () => {
+  const c = chartFor("Temp", "pio01", [29.9, 31.2, 31.84], "C", 1);
+  expect(c.label).toBe("Temp 31.8C (29.9-31.8)");
+  expect(c.label.length).toBeLessThanOrEqual(CHART_LABEL_CHARS);
+  expect(chartFor("Stir", undefined, [], "rpm", 0)).toEqual({ label: "Stir: no readings yet", bars: [] });
 });

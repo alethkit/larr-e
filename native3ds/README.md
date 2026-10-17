@@ -3,16 +3,39 @@
 A small homebrew app for the New 3DS. It shows the outer camera live on the top screen,
 with a green box in the middle. The bottom screen shows:
 
-- **fps**: frames captured and shown per second (the camera is set to 30 fps).
-- **brightness**: the average brightness (0–255) inside the green box. Point the box at the
+- **bright**: the average brightness (0–255) inside the green box. Point the box at the
   vial. A cloudy (turbid) culture scatters more light than clear medium, so this is a crude
   turbidity reading. It is a stand-in for a real model.
+- **fps**: frames captured and shown per second (the camera is set to 30 fps).
 - **classify**: how long `classify_frame` took, in milliseconds.
+- **LARR-E**, when it is linked: one line per unit (OD, temperature, growth rate, stirring;
+  "old" when the readings are stale), the latest alert from the last 10 minutes (red when
+  critical), and any hardware action waiting for approval. **Ⓐ approves, Ⓑ denies** the
+  action shown. Decisions are logged as made by `3ds`.
+
+## Link it to LARR-E
+
+The app talks straight to `larr-e api` over Wi-Fi, so it doesn't need the PocketJS bridge.
+Put a file `/3ds/larre.cfg` on the SD card:
+
+```
+url=http://192.168.43.10:8787
+token=<the same LARRE_API_TOKEN as larr-e api>
+```
+
+`url` is the computer running `larr-e api`, on the same network as the 3DS. Plain `http://`
+only. The app polls `GET /api/screen` every 2 s (a plain-text view made for this 40-column
+screen; see `api_server.screen_lines`) and sends decisions to `POST /api/approvals/<id>`. The
+title line says `online`, `wrong token (HTTP 401)` or `no connection (...)`. Without the file
+the camera still works on its own.
+
+The parsing code (`source/larre_cfg.c`, `source/screen.c`) has no 3DS dependencies.
+`tests/test_native3ds_logic.py` compiles and runs `test/test_logic.c` with the Mac's `cc`.
 
 `classify_frame()` in [`source/classify.c`](source/classify.c) is where a small int8 neural
 network (TensorFlow Lite Micro) will go. It gets one 320×240 RGB frame.
 
-This is separate from `../pocket3ds/` (the PocketJS dashboard) and from the Python code.
+It is separate from `../pocket3ds/` (the PocketJS dashboard), which needs the bridge.
 
 ## Build
 

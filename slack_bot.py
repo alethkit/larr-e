@@ -28,6 +28,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlencode
 
 import anthropic
 from slack_bolt import App
@@ -271,6 +272,7 @@ class LarreBot:
                         "text": {"type": "plain_text", "text": "Deny"},
                         "value": pending.id,
                     },
+                    *self._plan_adjust_buttons(tool, args),
                 ],
             },
         ]
@@ -291,6 +293,16 @@ class LarreBot:
             )
         self.audit(pending, "approved" if pending.approved else ("denied" if decided else "expired"))
         return pending.approved
+
+    def _plan_adjust_buttons(self, tool: str, args: dict[str, Any]) -> list[dict[str, Any]]:
+        if tool != "start_experiment":
+            return []
+        try:
+            unit = self.tools.resolve_unit(args.get("unit"))
+        except ToolError:
+            return []
+        button = self.adjust_button(unit)
+        return [button] if button else []
 
     def _plan_preview_blocks(self, tool: str, args: dict[str, Any]) -> list[dict[str, Any]]:
         """For start_experiment, show the plan and the exact profile the approver is agreeing to."""
@@ -444,13 +456,43 @@ class LarreBot:
             bits.append(f"growth {s['growth_rate']['value']:.3f} h⁻¹")
         return head + ("\n" + " · ".join(bits) if bits else "\n_(no live telemetry: is `larr-e listen` running?)_")
 
+    def adjust_button(self, unit: str | None) -> dict[str, Any] | None:
+        """A link to the /plan page for this unit, if the API's address and token are configured."""
+        base, token = self.cfg.api.public_url, self.cfg.api.token
+        if not (base and token and unit):
+            return None
+        query = urlencode({"k": token, "unit": unit})
+        return {"type": "button", "action_id": "larre_adjust", "url": f"{base.rstrip('/')}/plan?{query}",
+                "text": {"type": "plain_text", "text": "Adjust in LARR-E"}}
+
+    def upload_plan_chart(self, channel: str, thread_ts: str | None, plan: Any) -> None:
+        """The plan as a dashed target line with the measured readings over it, as on the /plan page."""
+        try:
+            result = self.tools.plot_plan(plan)
+        except ToolError:
+            return  # the plan sets no temperature or stirring speed
+        off = [f"{m} off target {v:g} min" for m, v in result["off_target_min"].items() if v]
+        caption = f"`{plan.unit}` · {plan.name}: plan vs measured · " + (", ".join(off) or "on target throughout")
+        try:
+            self.client.files_upload_v2(channel=channel, thread_ts=thread_ts, file=result["png_path"],
+                                        title=f"LARR-E plan vs measured · {plan.unit}", initial_comment=caption)
+        except SlackApiError as exc:
+            log.warning("Plan chart upload failed: %s", exc.response.get("error"))
+
     def post_progress(self, plan: Any, final: bool = False) -> None:
         target = self._update_target(plan)
         if not target:
             log.warning("Progress update for %s due, but no Slack channel is known", plan.unit)
             return
         channel, thread_ts = target
-        self.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=self.progress_text(plan, final))
+        text = self.progress_text(plan, final)
+        blocks = None
+        button = None if final else self.adjust_button(plan.unit)
+        if button:
+            blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}},
+                      {"type": "actions", "elements": [button]}]
+        self.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, blocks=blocks)
+        self.upload_plan_chart(channel, thread_ts, plan)
         minutes = max(1.0, min(plan.elapsed_h() or 0.0, plan.duration_h) * 60)
         for metrics in (["od", "growth_rate"], ["od", "temperature"]):
             try:
@@ -625,6 +667,10 @@ class LarreBot:
 
         app.action("larre_approve")(on_decision(True))
         app.action("larre_deny")(on_decision(False))
+
+        @app.action("larre_adjust")
+        def on_adjust(ack: Callable, body: dict[str, Any]) -> None:
+            ack()  # a link button: Slack opens the URL; the click still needs acknowledging
 
         @app.action("larre_plot_alert")
         def on_plot(ack: Callable, body: dict[str, Any]) -> None:

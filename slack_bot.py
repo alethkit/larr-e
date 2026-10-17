@@ -35,6 +35,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
 
 from agent import LarreAgent
+from linkwatch import LinkWatch
 from openai_compat import LLMError
 from config import Settings, settings as default_settings
 from listener import build_client
@@ -482,15 +483,46 @@ class LarreBot:
 
         threading.Thread(target=loop, name="larre-progress", daemon=True).start()
 
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        return f"{round(seconds)} s" if seconds < 90 else f"{round(seconds / 60)} min"
+
+    def post_link_down(self, seconds: float) -> None:
+        """The broker runs on the Pi, so the listener's alerts can't arrive: post this directly."""
+        channel = self.cfg.slack.alert_channel
+        if not channel:
+            log.warning("Lost contact with the Pioreactor, but LARRE_SLACK_ALERT_CHANNEL is not set")
+            return
+        self.client.chat_postMessage(channel=channel, text=(
+            f":electric_plug: *Lost contact with the Pioreactor* (`{self.cfg.mqtt.host}`) for "
+            f"{self._duration(seconds)}. LARR-E can't see or control it right now. If the Pi still has power, "
+            "its running jobs carry on by themselves. Check its power and Wi-Fi."))
+
+    def post_link_up(self, seconds: float) -> None:
+        channel = self.cfg.slack.alert_channel
+        if not channel:
+            return
+        self.client.chat_postMessage(channel=channel, text=(
+            f":white_check_mark: *Back in contact with the Pioreactor* after {self._duration(seconds)}. "
+            "Readings from the gap weren't recorded."))
+
     def start_mqtt(self) -> None:
         m = self.cfg.mqtt
         client = build_client(self.cfg, role="slackbot")
         alert_topic, triage_topic = f"{m.alert_topic_prefix}/+", f"{m.triage_topic_prefix}/+"
+        self.link = LinkWatch(m.link_grace_s, on_down=lambda s: self.submit(self.post_link_down, s),
+                              on_up=lambda s: self.submit(self.post_link_up, s))
+        self.link.start()
 
         def on_connect(client, userdata, flags, reason_code, properties):
             if not reason_code.is_failure:
+                self.link.connected()
                 client.subscribe([(alert_topic, 1), (triage_topic, 1)])
                 log.info("Subscribed to %s and %s", alert_topic, triage_topic)
+
+        def on_disconnect(client, userdata, flags, reason_code, properties):
+            log.warning("Lost the MQTT connection to %s (%s); reconnecting", m.host, reason_code)
+            self.link.disconnected()
 
         def on_message(client, userdata, msg):
             try:
@@ -502,7 +534,7 @@ class LarreBot:
             else:
                 self.submit(self.post_triage, payload)
 
-        client.on_connect, client.on_message = on_connect, on_message
+        client.on_connect, client.on_disconnect, client.on_message = on_connect, on_disconnect, on_message
         client.connect_async(m.host, m.port, m.keepalive)
         client.loop_start()
 

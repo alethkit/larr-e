@@ -35,6 +35,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from config import Settings, settings as default_settings
+from linkwatch import LinkWatch
 from schema import SCHEMA
 from tools import parse_timestamp, utc_timestamp
 
@@ -490,10 +491,27 @@ def run(cfg: Settings = default_settings, auto_triage: bool | None = None) -> No
     if recorder:
         console.print(f"[cyan]Recording telemetry into {cfg.pioreactor.db_path}[/cyan]")
 
+    # The broker is on the Pi: when it goes, our own alerts can't travel through it, so say it here
+    # (and over the webhook, if one is set). The Slack bot posts the same news to its channel.
+    def link_down(seconds: float) -> None:
+        console.print(Panel(f"[bold]Lost contact with the Pioreactor at {cfg.mqtt.host} for {round(seconds)} s.[/bold]\n"
+                            "LARR-E can't see or control it. If the Pi still has power, its jobs carry on.",
+                            title="🔌 LOST CONTACT", border_style="red"))
+        sink._slack(f":electric_plug: *Lost contact with the Pioreactor* ({cfg.mqtt.host}) for {round(seconds)} s.")
+
+    def link_up(seconds: float) -> None:
+        console.print(Panel(f"Back in contact after {round(seconds)} s. Readings from the gap weren't recorded.",
+                            title="✅ BACK ONLINE", border_style="green"))
+        sink._slack(f":white_check_mark: *Back in contact with the Pioreactor* after {round(seconds)} s.")
+
+    link = LinkWatch(cfg.mqtt.link_grace_s, on_down=link_down, on_up=link_up)
+    link.start()
+
     def on_connect(client, userdata, flags, reason_code, properties):
         if reason_code.is_failure:
             console.print(f"[red]MQTT connect failed: {reason_code}[/red]")
             return
+        link.connected()
         client.subscribe([(t, 0) for t in cfg.topics.all()])
         console.print(
             f"[green]Connected to {cfg.mqtt.host}:{cfg.mqtt.port}[/green]; watching "
@@ -502,6 +520,7 @@ def run(cfg: Settings = default_settings, auto_triage: bool | None = None) -> No
 
     def on_disconnect(client, userdata, flags, reason_code, properties):
         console.print(f"[yellow]MQTT disconnected ({reason_code}); reconnecting…[/yellow]")
+        link.disconnected()
 
     def on_message(client, userdata, msg):
         handle_message(msg.topic, msg.payload, state=state, detector=detector, emit=gate.submit,

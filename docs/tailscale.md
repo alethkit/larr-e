@@ -134,10 +134,34 @@ expiry", so it doesn't drop off the tailnet mid-experiment months from now.
 
 ```bash
 tailscale status | grep pio01
-curl -s http://pio01/api/workers/pio01/experiment     # same call LARR-E makes
+curl -s http://pio01.tail16b47e.ts.net/api/workers/pio01/experiment     # same call LARR-E makes
 ```
 
 Then do part C and run `uv run larr-e status`: telemetry should arrive as it did over the hotspot.
+
+### What actually happened (17 Oct, 19:00)
+
+- `pio01` joined a teammate's tailnet (`tail16b47e`), not alethkit's (`golden-gopher`), and was
+  **shared** into alethkit's. A shared device keeps its home tailnet's name and address:
+  `pio01.tail16b47e.ts.net`, `100.92.181.57`. The short name `pio01` does **not** resolve on the laptop.
+- alethkit's tailnet has **Tailnet Lock** on, so the shared Pi was locked out until a trusted key
+  signed it (`tailscale lock status` lists locked-out nodes; `tailscale lock sign nodekey:…` signs one,
+  and the laptop `lilith` holds a trusted key). If the Pi logs out and back in, its node key changes
+  and it needs signing again.
+- Checked from the laptop over Tailscale, all read-only: ping is direct over the hotspot (about 20 ms,
+  no relay), REST returns 200, MQTT 1883 accepts the login, `larr-e status` shows `pio01`, and SSH works.
+- SSH by IP needs the Pi's key and `IdentitiesOnly`, or the agent offers too many keys and the Pi
+  hangs up. Add to `~/.ssh/config`:
+  ```
+  Host pio01.tail16b47e.ts.net 100.92.181.57
+    User pioreactor
+    IdentityFile ~/.ssh/pioreactor
+    IdentitiesOnly yes
+  ```
+- The Pi still has Tailscale's DNS takeover on (`CorpDNS: true`). It's harmless so far. Turn it off
+  with `sudo tailscale set --accept-dns=false`.
+- Claude Code's sandbox can't read `.env`, so any `larr-e` command that needs the broker login has
+  to run outside it, whatever the network.
 
 ### Rollback
 
@@ -165,15 +189,15 @@ After B3 passes, change two lines in `.env` (and keep the old values in a commen
 switch back):
 
 ```bash
-LARRE_MQTT_HOST=pio01          # was pioreactor.local
-LARRE_LEADER_URL=http://pio01  # was http://pioreactor.local
+LARRE_MQTT_HOST=pio01.tail16b47e.ts.net          # was pioreactor.local (or use 100.92.181.57)
+LARRE_LEADER_URL=http://pio01.tail16b47e.ts.net  # was http://pioreactor.local
 ```
 
 The MQTT username and password stay the same: it's the same broker, reached by a different route.
 
 To run the real Pi and the twins together (decision 7 in `CLAUDE.md`), the twins still have to
 publish to the Pi's broker, because the listener follows one broker. Run the twin on the server
-with `--mqtt-host pio01`, put the broker login in that server's environment, and set
+with `--mqtt-host pio01.tail16b47e.ts.net`, put the broker login in that server's environment, and set
 `LARRE_LEADERS=twin1=http://charon:8790,...` on the laptop. Use part A's separate stack for
 anything experimental. Use this mixed setup only for the demo itself.
 

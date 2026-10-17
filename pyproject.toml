@@ -35,3 +35,5 @@ py-modules = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Claude Code's sandbox hides .env files; skipping them stops pytest crashing on its directory scan.
+addopts = ["--ignore=.env", "--ignore=.env.example"]

@@ -248,6 +248,10 @@ class ApiConfig:
     port: int = _env_int("LARRE_API_PORT", 8787)
     # Shared secret required on every request (?k=... or X-Larre-Token). Generated at startup if unset.
     token: str | None = _env("LARRE_API_TOKEN")
+    # Where phones in the Slack channel can reach `larr-e api`, e.g. http://192.168.1.20:8787. With a
+    # token set, Slack plan cards get an "Adjust in LARR-E" button that opens /plan. The link carries
+    # the token, so only set this for a private channel.
+    public_url: str | None = _env("LARRE_PUBLIC_URL")
     approval_timeout_s: float = _env_float("LARRE_API_APPROVAL_TIMEOUT_S", 180.0)
     workers: int = _env_int("LARRE_API_WORKERS", 4)
     max_jobs: int = _env_int("LARRE_API_MAX_JOBS", 100)

@@ -375,6 +375,8 @@ async function loadUnits() {
   const sel = $("unit");
   units.sort().forEach((u) => sel.appendChild(new Option(u, u)));
   if (!units.length) sel.appendChild(new Option("default unit", ""));
+  const wanted = new URLSearchParams(location.search).get("unit");  // from Slack's "Adjust in LARR-E"
+  if (wanted && units.includes(wanted)) sel.value = wanted;
 }
 
 // ------------------------------------------------------------ start, through the approval gate

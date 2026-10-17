@@ -109,6 +109,7 @@ export LARRE_DB_PATH=/home/pioreactor/.pioreactor/storage/pioreactor.sqlite
 # Slack: see section 4. (LARRE_SLACK_WEBHOOK_URL is a no-bot fallback; don't set it while the bot runs, or alerts post twice.)
 export LARRE_EFFORT=low                      # snappier answers on stage (default: medium)
 export LARRE_API_TOKEN=pick-a-long-random-string   # for `larr-e api`, the 3DS bridge and dashboard
+export LARRE_PUBLIC_URL=http://<laptop-ip>:8787        # optional: "Adjust in LARR-E" buttons in Slack open /plan (private channel only: the link carries the token)
 export LARRE_PUMP_TRANSPORT=rest             # default; start jobs via the leader's web API (see section 1)
 export LARRE_LEADER_URL=http://pioreactor.local   # the leader's web UI address
 export LARRE_LEADER_UNIT=pioreactor          # leader's unit name; defaults to the target unit (one-Pi cluster)

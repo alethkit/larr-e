@@ -187,6 +187,25 @@ class ExperimentPlan:
             "ends_at": _iso(self.ends_at()) if self.ends_at() else None,
         }
 
+    # "Off target" for charts (the /plan page in web/plan.html uses the same numbers). The heater
+    # takes minutes to warm a vial and the stirrer a few seconds to spin up, so the start is forgiven.
+    TEMP_TOLERANCE_C = 1.0
+    RPM_TOLERANCE_FRAC = 0.15
+    WARM_UP_S = 600
+    SPIN_UP_S = 30
+
+    def target(self, metric: str) -> float | None:
+        return {"temperature": self.temperature_c, "stirring": self.rpm}.get(metric)
+
+    def off_target(self, metric: str, seconds_in: float, value: float) -> bool:
+        """Whether a reading taken `seconds_in` after the plan started is off the plan's setpoint."""
+        target = self.target(metric)
+        if target is None or not 0 <= seconds_in <= self.duration_h * 3600:
+            return False
+        if metric == "temperature":
+            return seconds_in > self.WARM_UP_S and abs(value - target) > self.TEMP_TOLERANCE_C
+        return seconds_in > self.SPIN_UP_S and abs(value - target) > target * self.RPM_TOLERANCE_FRAC
+
     def public(self) -> dict[str, Any]:
         d = asdict(self)
         d["summary"] = self.summary()

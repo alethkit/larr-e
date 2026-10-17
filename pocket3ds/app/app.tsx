@@ -1,7 +1,7 @@
 import { Show } from "solid-js";
 import { AuxiliarySurface, Text, View } from "@pocketjs/framework/components";
 import { ClassicButton } from "@pocketjs/framework/classic";
-import { ANSWER_LINES, CHART_BARS, MAX_UNITS, SPARK_HEIGHT } from "../shared/protocol.ts";
+import { ANSWER_LINES, CHART_BARS, MAX_PRESETS, MAX_UNITS, SPARK_HEIGHT } from "../shared/protocol.ts";
 import { createLarre, type Larre } from "./store.ts";
 
 const range = (n: number) => Array.from({ length: n }, (_, i) => i);
@@ -56,11 +56,12 @@ function Dashboard(p: { s: Larre }) {
 /** 320x240 lower screen: requests, and the approval gate when the agent wants to touch hardware. */
 function Controls(p: { s: Larre }) {
   const { s } = p;
-  const buttons = range(4).map(i => (
+  // Three rows of two: 38px buttons on a 44px pitch.
+  const buttons = range(MAX_PRESETS).map(i => (
     <ClassicButton debugName={`Preset${i}`} surface="auxiliary"
       label={s.presets()[i]?.label ?? ""} tone={s.presets()[i]?.exec ? "danger" : "primary"}
       disabled={!s.presets()[i] || !!s.job() || !!s.approval()}
-      style={{ posType: 1, insetL: 8 + (i % 2) * 156, insetT: 34 + Math.floor(i / 2) * 58, width: 148, height: 50 }}
+      style={{ posType: 1, insetL: 8 + (i % 2) * 156, insetT: 32 + Math.floor(i / 2) * 44, width: 148, height: 38 }}
       onPress={() => s.run(i)} />
   ));
   const approve = <ClassicButton debugName="Approve" surface="auxiliary" allowWhenBlocked label="Approve (A)" tone="primary"
@@ -75,10 +76,10 @@ function Controls(p: { s: Larre }) {
       <Text class="absolute left-[8] top-[6] text-xs font-bold text-white">Ask LARR-E</Text>
       <Text class="absolute right-[8] top-[6] text-xs text-white">{s.status()}</Text>
     </View>
-    <View debugName="Selection" class="absolute w-[154] h-[56]" style={{ bgColor: "#fbbf24",
-      insetL: 5 + (s.selected() % 2) * 156, insetT: 31 + Math.floor(s.selected() / 2) * 58 }} />
+    <View debugName="Selection" class="absolute w-[154] h-[44]" style={{ bgColor: "#fbbf24",
+      insetL: 5 + (s.selected() % 2) * 156, insetT: 29 + Math.floor(s.selected() / 2) * 44 }} />
     {buttons}
-    <Text class="absolute left-[8] top-[154] text-xs" style={{ textColor: 0xffb8a394 }}>Tap a request, or D-pad + A. Red ones move hardware.</Text>
+    <Text class="absolute left-[8] top-[168] text-xs" style={{ textColor: 0xffb8a394 }}>Tap a request, or D-pad + A. Red ones move hardware.</Text>
     <Text class="absolute left-[8] top-[222] text-xs" style={{ textColor: 0xffb8a394 }}>L+R+START: exit</Text>
     <View debugName="ApprovalGate" class="absolute left-0 top-0 w-full h-full"
       style={{ display: s.approval() ? 0 : 1, bgColor: "#422006" }}>

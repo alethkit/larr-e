@@ -87,6 +87,17 @@ PRESET_LIBRARY: dict[str, dict[str, str]] = {
         "prompt": "Heat the default unit to 32 C: start the temperature automation (thermostat) with "
         "target_temperature 32. If it is already running, set its target temperature to 32 instead.",
     },
+    "pump": {
+        "label": "Pump media 2 s",
+        "mode": "exec",
+        "prompt": "Run the media pump on the default unit for 2 seconds (dose with pump=media, duration_s=2).",
+    },
+    "exchange": {
+        "label": "Swap media 2 s",
+        "mode": "exec",
+        "prompt": "Exchange media on the default unit: run the media pump for 2 seconds (dose pump=media, "
+        "duration_s=2), then the waste pump for 2 seconds (dose pump=waste, duration_s=2).",
+    },
     "stop": {
         "label": "Stop stir + heat",
         "mode": "exec",

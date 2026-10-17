@@ -88,6 +88,8 @@ class SafetyLimits:
 
     max_dose_ml: float = _env_float("LARRE_MAX_DOSE_ML", 5.0)
     max_dose_duration_s: float = _env_float("LARRE_MAX_DOSE_DURATION_S", 30.0)
+    # Without a pump calibration the Pioreactor can't turn ml into pump time: dose by seconds only.
+    pumps_calibrated: bool = _env_bool("LARRE_PUMPS_CALIBRATED", True)
     min_temperature_c: float = _env_float("LARRE_MIN_TEMP_C", 20.0)
     max_temperature_c: float = _env_float("LARRE_MAX_TEMP_C", 45.0)
     max_stirring_rpm: float = _env_float("LARRE_MAX_RPM", 1500.0)
@@ -191,7 +193,7 @@ class ApiConfig:
     workers: int = _env_int("LARRE_API_WORKERS", 4)
     max_jobs: int = _env_int("LARRE_API_MAX_JOBS", 100)
     # Which preset requests the 3DS / dashboard show, in order (the 3DS shows the first four).
-    # Available: summary, triage, trend, dilute, stir, heat, stop.
+    # Available: summary, triage, trend, dilute, stir, heat, pump, exchange, stop.
     presets: str = _env("LARRE_PRESETS", "summary,triage,trend,dilute")
 
 

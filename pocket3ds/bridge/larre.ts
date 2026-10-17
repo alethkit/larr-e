@@ -2,7 +2,7 @@
  * The provider kills a request after 9 s, so every call here is short: agent questions
  * start a job and the 3DS polls it. */
 import {
-  ANSWER_LINES, BOTTOM_COLS, CHART_BARS, CHART_LABEL_CHARS, DEFAULT_PRESETS, MAX_UNITS, SPARK_HEIGHT, TOP_COLS,
+  ANSWER_LINES, BOTTOM_COLS, CHART_BARS, CHART_LABEL_CHARS, DEFAULT_PRESETS, MAX_PRESETS, MAX_UNITS, SPARK_HEIGHT, TOP_COLS,
   type AlertInfo, type ApprovalInfo, type ChartInfo, type JobState, type Preset, type Snapshot, type UnitRow,
 } from "../shared/protocol.ts";
 import { encode, shape, toAscii } from "./format.ts";
@@ -84,7 +84,7 @@ export function createMethods(cfg: BridgeConfig) {
   async function loadPresets() {
     if (presets) return presets;
     const data = await api.call<{ presets: { name: string; label: string; mode: string }[] }>("GET", "/api/presets");
-    presets = data.presets.slice(0, 4).map(p => ({ name: p.name, label: toAscii(p.label).slice(0, 20), exec: p.mode === "exec" }));
+    presets = data.presets.slice(0, MAX_PRESETS).map(p => ({ name: p.name, label: toAscii(p.label).slice(0, 20), exec: p.mode === "exec" }));
     return presets;
   }
 

@@ -77,7 +77,7 @@ await shot("01-dashboard");
 await tap(80, 58);            // "Health check" (top-left preset button)
 await settle(2500);
 await shot("02-answer");
-await press(BTN.RIGHT); await press(BTN.DOWN); // select "Dilute 0.5 ml" with the D-pad
+await press(BTN.RIGHT); await press(BTN.DOWN); await press(BTN.DOWN); // bottom-right preset (a hardware action)
 await press(BTN.CIRCLE);      // A
 await settle(2500);
 await shot("03-approval");

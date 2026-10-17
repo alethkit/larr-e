@@ -132,7 +132,8 @@ READ_TOOLS = [
 ACTION_TOOLS = [
     _tool(
         "dose",
-        "Run a peristaltic pump once. Give exactly one of ml or duration_s.",
+        "Run a peristaltic pump once. Give exactly one of ml or duration_s. Uncalibrated pumps "
+        "accept only duration_s (the tool says so if you try ml).",
         {
             "pump": {"type": "string", "enum": sorted(PUMP_JOBS)},
             "unit": UNIT,

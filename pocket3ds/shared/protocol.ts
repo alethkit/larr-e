@@ -11,6 +11,7 @@ export const CHART_BARS = 20; // per chart; two charts side by side on the top s
 export const SPARK_HEIGHT = 28;
 export const CHART_LABEL_CHARS = 27;
 export const MAX_UNITS = 3;
+export const MAX_PRESETS = 6; // touch buttons on the bottom screen, 2 per row
 
 export type UnitRow = { text: string; alarm: boolean };
 export type AlertInfo = { title: string; critical: boolean; lines: string[] };

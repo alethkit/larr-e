@@ -267,6 +267,8 @@ class PioreactorTools:
         if (ml is None) == (duration_s is None):
             raise ToolError("Give exactly one of ml or duration_s.")
         limits = self.cfg.safety
+        if ml is not None and not limits.pumps_calibrated:
+            raise ToolError("The pumps are not calibrated, so ml can't be measured. Use duration_s (seconds) instead.")
         if ml is not None:
             if not 0 < ml <= limits.max_dose_ml:
                 raise ToolError(f"ml must be in (0, {limits.max_dose_ml}] (safety limit).")

@@ -15,6 +15,8 @@ const TOOL_TITLES: Record<string, string> = {
   set_stirring_rpm: "Change stirring",
   start_job: "Start a job",
   stop_job: "Stop a job",
+  start_experiment: "Start experiment",
+  stop_experiment: "Stop experiment",
 };
 const ALERT_MAX_AGE_S = 600;
 

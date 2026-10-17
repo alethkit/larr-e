@@ -31,6 +31,10 @@ act on the hardware in plain English, with hard safety limits and a human confir
 | `api_server.py` | Local HTTP API (`larr-e api`): status, alerts, data, agent jobs and approvals, behind a token |
 | `web/dashboard.html` | Dashboard for small, old browsers, including the Nintendo 3DS browser. Served by the API |
 | `pocket3ds/` | Native Nintendo 3DS app (PocketJS) and the bridge that pairs it with the API. See [pocket3ds/README.md](pocket3ds/README.md) |
+| `experiment.py` | Experiment plans: request → Pioreactor experiment profile YAML, persisted plan, expected state, update timing |
+| `leader_api.py` | Small client for the leader's REST API: start/stop jobs, upload and run profiles |
+| `twin.py` | Digital twin: virtual Pioreactors with a growth/thermal model, the same REST and MQTT interfaces, and injectable faults (`larr-e twin`) |
+| `schema.py` | The Pioreactor SQLite tables LARR-E reads, shared by the recorder and the demo injector |
 | `inject_anomaly.py` | Demo helper that publishes Pioreactor-format fake telemetry to trigger alerts on cue |
 
 ---
@@ -47,7 +51,7 @@ LARR-E uses the same MQTT conventions as the Pioreactor web UI. No firmware chan
 | Stirring | `pioreactor/<unit>/<exp>/stirring/measured_rpm` | `{"measured_rpm": 498, "timestamp": "…Z"}` |
 | Change a setting | `pioreactor/<unit>/<exp>/<job>/<attr>/set` | `32` |
 | Stop a job | `pioreactor/<unit>/<exp>/<job>/$state/set` | `disconnected` |
-| Run a pump/job | `pioreactor/<unit>/<exp>/run/add_media` | `{"options": {"ml": 1.0}, "args": []}` |
+| Run a pump/job | REST, not MQTT: `POST /api/workers/<unit>/jobs/run/job_name/add_media/experiments/<exp>` | `{"options": {"ml": 1.0}, "args": []}` |
 | LARR-E alerts | `larre/alerts/<unit>` | alert JSON (kept outside `pioreactor/` so it is never stored) |
 | LARR-E triage | `larre/triage/<unit>` | `{"alert_id": "…", "unit": "…", "note": "…"}` |
 
@@ -56,11 +60,12 @@ History comes from the leader's SQLite database
 `growth_rates`, `stirring_rates`, `dosing_events`, `experiments`. It is opened read-only, and an
 SQLite authorizer rejects any statement that is not a read.
 
-> **Check against your Pioreactor software version.** These topics match the published Pioreactor
-> conventions, but the `run/<job>` command path and payload have changed between releases. Before
-> demo day, confirm in a dry run that one `larr-e exec "pump 0.5 ml of media"` actually spins the
-> pump. If it doesn't, run the agent on the leader with `LARRE_PUMP_TRANSPORT=pios`, which
-> shells out to `pios run add_media --units <unit> --ml …` instead.
+> **Starting jobs uses REST, not MQTT.** Changing a setting (`…/set`) and stopping a job
+> (`$state/set`) over MQTT work. Starting one over MQTT doesn't: Pioreactor 26.11 has no subscriber
+> for `pioreactor/<unit>/<exp>/run/<job>`, and on a real Pi a publish there started nothing. LARR-E
+> therefore starts jobs through the leader's web API (`LARRE_PUMP_TRANSPORT=rest`, the default:
+> `POST /api/workers/<unit>/jobs/run/job_name/<job>/experiments/<exp>`, the same call the Pioreactor
+> UI and MCP server make), or `pios` when running on the leader. Any other value is refused.
 
 ---
 
@@ -73,14 +78,26 @@ SQLite authorizer rejects any statement that is not a read.
 - Calibrated pumps if you want to dose by **ml** (otherwise dose by duration, e.g. "run the media pump for 2 seconds")
 
 ### Install
+With [uv](https://docs.astral.sh/uv/) (versions pinned in `uv.lock`):
 ```bash
 git clone <your repo> larr-e && cd larr-e
+uv sync                          # creates .venv; add --group dev for the tests
+uv run larr-e status             # or `source .venv/bin/activate` and just `larr-e ...`
+uv run --group dev pytest        # tests (no hardware, Slack or API key)
+```
+Without uv (e.g. on the Pi):
+```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 alias larr-e="python $(pwd)/agent.py"
 ```
 
 ### Configure (env vars; full list in `config.py`)
+Put settings, and above all secrets, in a `.env` file: `cp .env.example .env`, then fill it in.
+It's gitignored, and LARR-E loads it at startup. Anything already set in the environment wins.
+`.claude/settings.json` stops Claude Code from reading `.env`, so keys don't end up in a model's
+context; you edit the file yourself. Use a dedicated Anthropic key for LARR-E with a spend limit,
+and revoke it after the event. The same variables can also be exported in the shell:
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 export LARRE_MQTT_HOST=pioreactor.local      # the leader's hostname or IP
@@ -92,6 +109,10 @@ export LARRE_DB_PATH=/home/pioreactor/.pioreactor/storage/pioreactor.sqlite
 # Slack: see section 4. (LARRE_SLACK_WEBHOOK_URL is a no-bot fallback; don't set it while the bot runs, or alerts post twice.)
 export LARRE_EFFORT=low                      # snappier answers on stage (default: medium)
 export LARRE_API_TOKEN=pick-a-long-random-string   # for `larr-e api`, the 3DS bridge and dashboard
+export LARRE_PUMP_TRANSPORT=rest             # default; start jobs via the leader's web API (see section 1)
+export LARRE_LEADER_URL=http://pioreactor.local   # the leader's web UI address
+export LARRE_LEADER_UNIT=pioreactor          # leader's unit name; defaults to the target unit (one-Pi cluster)
+export LARRE_UPDATE_EVERY_H=2                # default spacing of Slack progress updates
 ```
 
 **LLM backend.** The default is Claude (`ANTHROPIC_API_KEY`). To use open models through
@@ -116,6 +137,43 @@ backend you'll present with.
 Run the agent **on the leader** to get direct DB access. To run it from a laptop, copy the DB over
 first (`scp pioreactor@pioreactor.local:.pioreactor/storage/pioreactor.sqlite ./runtime/`) and point
 `LARRE_DB_PATH` at the copy.
+
+### Digital twin and mixed clusters
+
+`twin.py` runs virtual Pioreactors on a laptop. Each one has a thermostat that heats toward its
+setpoint (it can't cool below ambient), stirring that ramps to its target, logistic growth that
+depends on temperature and stirring, and pumps that dilute. The twin answers on the same REST
+paths and MQTT topics as a real leader, so LARR-E drives it with the same code, profiles
+included. Biology runs 10× faster by default (`--bio-speed`), but schedules run in real time.
+
+Pioreactor's own test mode is not a twin. Its mock hardware keeps OD flat, fakes temperature as a
+sine wave around 25 °C whatever the heater does, and always reports the initial RPM.
+
+```bash
+larr-e twin --units twin1,twin2 --experiment larre-demo --mqtt-host 127.0.0.1 --port 8790   # terminal 1
+export LARRE_MQTT_HOST=127.0.0.1 LARRE_PUMP_TRANSPORT=rest LARRE_RECORD_DB=1 \
+       LARRE_DB_PATH=./runtime/cluster.sqlite \
+       LARRE_LEADERS="twin1=http://127.0.0.1:8790,twin2=http://127.0.0.1:8790"
+larr-e listen                                                # terminal 2: alerts + records history
+larr-e exec "run twin1 at 37 degrees and 180 rpm for 10 minutes, update me every 3 minutes"
+curl -X POST localhost:8790/twin/fault -d '{"unit":"twin1","fault":"stir_stall"}'     # trip an alert
+curl localhost:8790/twin/state                               # ground truth, for checking LARR-E
+```
+
+Faults: `heater_fail`, `stir_stall`, `bubble` (one OD spike), `contamination` (growth jumps),
+`vial_removed` (OD to zero), and `clear` to remove them all.
+
+**Adding the real Pi.** Point MQTT at the Pi's broker (`LARRE_MQTT_HOST=pioreactor.local`, plus
+credentials) and start the twin with the same `--mqtt-host`, so both report in one place. Leave
+the Pi's unit out of `LARRE_LEADERS`; it uses `LARRE_LEADER_URL`. Leave `LARRE_EXPERIMENT` unset:
+LARR-E asks each unit's leader which experiment the unit is assigned to. `/larr-e units` lists
+every unit, real and twin. Caveat: the Pi's `mqtt_to_db_streaming` may also store the twin's
+readings in the Pi's database, so give the twin its own experiment name.
+
+**Profiles and shared experiments.** On Pioreactor, stopping `experiment_profile` through the
+leader stops every profile in the experiment. `stop_experiment` therefore finds its own run by
+`profile_filename` and stops it by `job_id`, leaving other units' plans running. The twin copies
+Pioreactor's behaviour so the tests would catch a regression.
 
 ### Rehearse with no hardware
 ```bash
@@ -151,6 +209,38 @@ larr-e listen [--no-triage]
 larr-e slack                                        # Slack bot front end (section 4)
 larr-e api                                          # HTTP API + 3DS/phone dashboard (section 5)
 ```
+
+**Whole experiments**
+
+```bash
+larr-e exec "run the vial at 37 degrees and 180 rpm for 18 hours, update me every 2 hours"
+larr-e query "how is the experiment going?"
+larr-e exec "stop the experiment"
+```
+
+LARR-E doesn't drive a long experiment one command at a time. It turns the request into an
+`ExperimentPlan` (`experiment.py`) and from that a Pioreactor
+[experiment profile](https://docs.pioreactor.com/user-guide/experiment-profiles-schema) that
+starts stirring, the thermostat, OD reading and growth rate at t = 0 and stops them at t = 18 h.
+The leader validates the profile on upload, then runs it. **The Pioreactor owns the schedule**, so
+the experiment ends correctly even if the laptop, the bot or the Claude API goes away.
+
+LARR-E keeps the plan in `runtime/experiment_plans.json` (one per unit, survives restarts) and uses it to:
+- show the approver the exact profile YAML on the Approve/Deny card,
+- tell triage and the agent what is *supposed* to be happening (`expected_state`), so a job
+  stopping at the planned end isn't reported as a fault,
+- post progress updates (status line + plot, no LLM call) to the Slack thread that started the
+  experiment every `update_every_h`, and a final message at the end. `/larr-e experiment` shows it on demand.
+
+`plan_experiment` previews without touching anything. `start_experiment` and `stop_experiment` need approval.
+LARR-E refuses to start a second plan on a unit that already has one running. Pioreactor's own
+profile dry-run executes in real time, so we don't use it as a pre-flight check.
+
+Tests: `pytest tests/` (no hardware, Slack or API key). `tests/test_twin_cluster.py` runs a real
+MQTT broker, a two-unit twin, the listener and the tools end to end (about 50 s; needs
+`mosquitto` or `pip install amqtt`). To also check the generated profile
+against Pioreactor's own schema validator, clone `Pioreactor/pioreactor` and run with
+`PYTHONPATH=pioreactor/core GLOBAL_CONFIG=pioreactor/config.dev.ini TESTING=1`.
 
 **Safety model**
 - `query` mode never offers hardware tools to the model.
@@ -266,7 +356,7 @@ Approvals from any front end are logged in `runtime/audit.jsonl`, tagged with th
 ### T-30 min pre-flight checklist
 1. `ping pioreactor.local`, then `larr-e status`: the demo unit shows live OD, temperature and RPM.
 2. Start `od_reading`, `growth_rate_calculating`, `stirring` (500 RPM) and the thermostat (30 °C) from the Pioreactor UI.
-3. `larr-e exec "pump 0.5ml of media" --yes`: **the pump must audibly run.** If not, switch to `LARRE_PUMP_TRANSPORT=pios`.
+3. `larr-e exec "pump 0.5ml of media" --yes`: **the pump must audibly run.** If not, check `LARRE_LEADER_URL` reaches the leader's web UI.
 4. `larr-e query "plot the last 10 minutes of OD against temperature"` renders a chart.
 5. `export LARRE_ALERT_COOLDOWN_S=20`, so you can re-trigger if a judge asks.
 6. Clear old alerts: `rm runtime/alerts.jsonl`. Leave `larr-e listen` running in pane A.

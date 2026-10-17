@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import signal
+import sqlite3
 import statistics
 import threading
 import time
@@ -26,6 +27,7 @@ import uuid
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 import paho.mqtt.client as mqtt
@@ -33,6 +35,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from config import Settings, settings as default_settings
+from schema import SCHEMA
 from tools import parse_timestamp, utc_timestamp
 
 console = Console()
@@ -227,6 +230,46 @@ class LiveState:
             self._flush()
 
 
+class Recorder:
+    """Writes every reading into a local Pioreactor-schema SQLite (LARRE_RECORD_DB=1).
+
+    The leader's own database lives on the Pi, and digital-twin units have none, so a LARR-E
+    running on a laptop records what it hears. Writes are committed at most once a second.
+    """
+
+    TABLES = {"temperature": "temperature_readings", "growth_rate": "growth_rates", "stirring": "stirring_rates"}
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(path), check_same_thread=False)
+        self.conn.executescript(SCHEMA)
+        self.experiments: set[str] = set()
+        self._last_commit = 0.0
+
+    def record(self, r: "Reading") -> None:
+        if r.experiment not in self.experiments:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO experiments (experiment, created_at, description) VALUES (?, ?, ?)",
+                (r.experiment, r.timestamp, "recorded by LARR-E"),
+            )
+            self.experiments.add(r.experiment)
+        if r.metric.startswith("od"):
+            self.conn.execute(
+                "INSERT INTO od_readings VALUES (?, ?, ?, ?, ?, ?)",
+                (r.experiment, r.unit, r.timestamp, r.value, 90, int(r.metric[2:] or 1)),
+            )
+        elif r.metric in self.TABLES:
+            self.conn.execute(
+                f"INSERT INTO {self.TABLES[r.metric]} VALUES (?, ?, ?, ?)", (r.experiment, r.unit, r.timestamp, r.value)
+            )
+        if time.monotonic() - self._last_commit >= 1.0:
+            self.flush()
+
+    def flush(self) -> None:
+        self.conn.commit()
+        self._last_commit = time.monotonic()
+
+
 class AlertSink:
     def __init__(self, cfg: Settings, client: mqtt.Client, auto_triage: bool):
         self.cfg = cfg
@@ -306,6 +349,9 @@ def run(cfg: Settings = default_settings, auto_triage: bool | None = None) -> No
     state = LiveState(cfg)
     client = build_client(cfg)
     sink = AlertSink(cfg, client, auto_triage)
+    recorder = Recorder(cfg.pioreactor.db_path) if cfg.pioreactor.record_db else None
+    if recorder:
+        console.print(f"[cyan]Recording telemetry into {cfg.pioreactor.db_path}[/cyan]")
 
     def on_connect(client, userdata, flags, reason_code, properties):
         if reason_code.is_failure:
@@ -325,6 +371,8 @@ def run(cfg: Settings = default_settings, auto_triage: bool | None = None) -> No
         if reading is None:
             return
         state.update(reading)
+        if recorder:
+            recorder.record(reading)
         alert = detector.observe(reading)
         if alert:
             sink.emit(alert)
@@ -346,6 +394,8 @@ def run(cfg: Settings = default_settings, auto_triage: bool | None = None) -> No
         pass
     finally:
         state.flush()
+        if recorder:
+            recorder.flush()
         sink.pool.shutdown(wait=False, cancel_futures=True)
         console.print("[cyan]Listener stopped.[/cyan]")
 

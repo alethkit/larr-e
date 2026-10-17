@@ -1,5 +1,11 @@
 /runtime/
 __pycache__/
 .venv/
+*.egg-info/
+.env
+.env.*
+!.env.example
+# private raw material (design thread export, organiser PDFs): see CLAUDE.md
+/notes/
 rehearsal.env
 real.env

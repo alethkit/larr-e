@@ -12,6 +12,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _load_env_file(path: Path) -> None:
+    """Load KEY=VALUE lines from a .env file into os.environ, never overriding variables already set.
+
+    Secrets (Anthropic, Slack, MQTT) live in this gitignored file so they never need to be in the
+    shell, a settings UI, or a prompt. Supports comments, blank lines, `export KEY=...` and quotes.
+    """
+    try:
+        lines = path.read_text().splitlines()
+    except (FileNotFoundError, PermissionError):
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()  # trailing comment on an unquoted value
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file(Path(os.environ.get("LARRE_ENV_FILE", Path(__file__).resolve().parent / ".env")))
+
+
 def _env(name: str, default: str | None = None) -> str | None:
     value = os.environ.get(name)
     return value if value not in (None, "") else default
@@ -73,12 +100,30 @@ class PioreactorConfig:
     default_unit: str | None = _env("LARRE_DEFAULT_UNIT")
     # If unset, the experiment is resolved from live telemetry, then from SQLite.
     experiment: str | None = _env("LARRE_EXPERIMENT")
-    # How jobs are started, changed and stopped:
-    # "http": the leader's web API, /api/workers/<unit>/jobs/... (Pioreactor 25+; works from any machine).
-    # "mqtt": publish to pioreactor/<unit>/<exp>/run/<job> and .../<attr>/set (older Pioreactor software).
-    # "pios": shell out to `pios run ...` (only on the leader).
-    pump_transport: str = _env("LARRE_JOB_TRANSPORT", _env("LARRE_PUMP_TRANSPORT", "mqtt"))
+    # How jobs and pumps are started:
+    # "rest": the leader's HTTP API, as the Pioreactor web UI and MCP server do (works from any machine).
+    # "pios": shell out to `pios run ...` (only on the leader; it calls the same API).
+    # There is no MQTT option: Pioreactor 26.11 has no subscriber for pioreactor/<unit>/<exp>/run/<job>,
+    # and on a real Pi a publish there started nothing. Anything else is refused when a job starts.
+    # LARRE_JOB_TRANSPORT is the same setting under its newer name.
+    pump_transport: str = _env("LARRE_JOB_TRANSPORT", _env("LARRE_PUMP_TRANSPORT", "rest"))
+    # Leader web server (port 80 on a stock image). Used by the "rest" transport and experiment plans.
     leader_url: str = _env("LARRE_LEADER_URL", "http://pioreactor.local")
+    # Leader's unit name: experiment profiles execute on the leader. In a one-Pi cluster it is the worker too.
+    leader_unit: str | None = _env("LARRE_LEADER_UNIT")
+    # Units served by a different leader, e.g. digital-twin units next to the real Pi:
+    #   LARRE_LEADERS="twin1=http://127.0.0.1:8790,twin2=http://127.0.0.1:8790"
+    # A unit listed here is its own leader. Unlisted units use leader_url / leader_unit.
+    leaders: dict[str, str] = field(
+        default_factory=lambda: dict(
+            pair.split("=", 1) for pair in (_env("LARRE_LEADERS", "") or "").replace(" ", "").split(",") if "=" in pair
+        )
+    )
+    # Record every telemetry reading the listener sees into db_path (Pioreactor schema). Use this
+    # when LARR-E runs on a laptop: the leader's own database lives on the Pi, and twin units have none.
+    record_db: bool = _env_bool("LARRE_RECORD_DB", False)
+    # Where the leader keeps profiles (the execute command needs the full path on the leader).
+    profile_dir: str = _env("LARRE_PROFILE_DIR", "/home/pioreactor/.pioreactor/experiment_profiles")
     dry_run: bool = _env_bool("LARRE_DRY_RUN", False)
 
 
@@ -154,6 +199,7 @@ class OutputConfig:
     history_points: int = _env_int("LARRE_HISTORY_POINTS", 40)
     history_step_s: float = _env_float("LARRE_HISTORY_STEP_S", 5.0)
     audit_path: Path = RUNTIME_DIR / "audit.jsonl"  # who requested and who approved each hardware action
+    plans_path: Path = RUNTIME_DIR / "experiment_plans.json"  # the active plan per unit
     plots_dir: Path = RUNTIME_DIR / "plots"
     # Webhook posting from listener.py. Leave unset when slack_bot.py is running,
     # which posts the same alerts itself with buttons and threads.
@@ -198,6 +244,19 @@ class ApiConfig:
 
 
 @dataclass(frozen=True)
+class PlanConfig:
+    """Experiment plans (experiment.py): one scheduled profile per unit, persisted across restarts."""
+
+    max_duration_h: float = _env_float("LARRE_MAX_EXPERIMENT_H", 72.0)
+    default_update_every_h: float = _env_float("LARRE_UPDATE_EVERY_H", 2.0)
+    # Pioreactor's own profile dry-run executes in real time (an 18 h profile logs for 18 h), so we
+    # don't use it as a pre-flight check. The leader validates a profile when it is uploaded instead.
+    # Slack channel for progress updates; falls back to the alert channel.
+    update_channel: str | None = _env("LARRE_SLACK_UPDATE_CHANNEL")
+    check_every_s: float = _env_float("LARRE_PLAN_CHECK_EVERY_S", 60.0)
+
+
+@dataclass(frozen=True)
 class Settings:
     mqtt: MQTTConfig = field(default_factory=MQTTConfig)
     topics: TopicConfig = field(default_factory=TopicConfig)
@@ -208,6 +267,7 @@ class Settings:
     output: OutputConfig = field(default_factory=OutputConfig)
     slack: SlackConfig = field(default_factory=SlackConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
+    plans: PlanConfig = field(default_factory=PlanConfig)
 
     def ensure_dirs(self) -> None:
         self.output.runtime_dir.mkdir(parents=True, exist_ok=True)

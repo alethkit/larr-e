@@ -1,16 +1,11 @@
 """Hardware and data toolset that the LLM routing layer calls.
 
-Actuators reach the Pioreactor cluster through one of three transports (LARRE_JOB_TRANSPORT):
+Actuators use the same interfaces as the Pioreactor web UI:
 
-* "http" (Pioreactor 25+), the leader's web API, as the web UI uses it:
-    start   POST /api/workers/<unit>/jobs/run/job_name/<job>/experiments/<exp>     {"options": {...}}
-    change  POST /api/workers/<unit>/jobs/update/job_name/<job>/experiments/<exp>  {"settings": {...}}
-    stop    POST /api/workers/<unit>/jobs/stop/job_name/<job>/experiments/<exp>
-* "mqtt" (older software):
-    change  pioreactor/<unit>/<exp>/<job>/<attr>/set
-    stop    pioreactor/<unit>/<exp>/<job>/$state/set  -> "disconnected"
-    start   pioreactor/<unit>/<exp>/run/<job>  -> {"options": {...}, "args": []}
-* "pios": `pios run ...` on the leader.
+* change a running job's setting:  MQTT pioreactor/<unit>/<exp>/<job>/<attr>/set
+* stop a job:                      MQTT pioreactor/<unit>/<exp>/<job>/$state/set  -> "disconnected"
+* start a job (e.g. a pump):       REST POST /api/workers/<unit>/jobs/run/job_name/<job>/experiments/<exp>
+                                   (Pioreactor has no MQTT subscriber for starting jobs)
 
 Reads come from the leader's SQLite database (opened read-only) and from the
 live state snapshot that listener.py keeps up to date.
@@ -23,17 +18,17 @@ import shlex
 import sqlite3
 import subprocess
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import paho.mqtt.publish as mqtt_publish
 
 from config import Settings, settings as default_settings
+from experiment import ExperimentPlan, PlanStore
+from leader_api import LeaderAPI, LeaderAPIError
 
 
 class ToolError(Exception):
@@ -114,6 +109,8 @@ class PioreactorTools:
         self.cfg = cfg
         self.dry_run = cfg.pioreactor.dry_run if dry_run is None else dry_run
         self.render_terminal = render_terminal
+        self._leaders: dict[str, LeaderAPI] = {}
+        self.plans = PlanStore(cfg.output.plans_path)
         cfg.ensure_dirs()
 
     # ------------------------------------------------------------------ context
@@ -131,21 +128,64 @@ class PioreactorTools:
         )
 
     def resolve_experiment(self, unit: str | None = None) -> str:
-        if self.cfg.pioreactor.experiment:
-            return self.cfg.pioreactor.experiment
+        # In a mixed cluster (real Pi + twin) units run different experiments, so what a unit is
+        # actually streaming wins over the global setting.
         state = self._live_state()
         if unit and unit in state and state[unit].get("experiment"):
             return state[unit]["experiment"]
+        if unit and not self.dry_run:
+            assigned = self.leader_for(unit).assigned_experiment(unit)
+            if assigned:
+                return assigned
+        if self.cfg.pioreactor.experiment:
+            return self.cfg.pioreactor.experiment
         try:
             with self._connect_ro() as conn:
-                row = conn.execute(
+                row = None
+                if unit:
+                    row = conn.execute(
+                        "SELECT experiment FROM od_readings WHERE pioreactor_unit = ? ORDER BY timestamp DESC LIMIT 1",
+                        (unit,),
+                    ).fetchone()
+                row = row or conn.execute(
                     "SELECT experiment FROM experiments ORDER BY created_at DESC LIMIT 1"
                 ).fetchone()
-        except ToolError:
+        except (ToolError, sqlite3.DatabaseError):
             row = None
         if row:
             return row[0]
         raise ToolError("Could not determine the active experiment; set LARRE_EXPERIMENT.")
+
+    def leader_for(self, unit: str) -> LeaderAPI:
+        """The REST API that controls this unit: its own (twin) leader if mapped, else the main leader."""
+        url = self.cfg.pioreactor.leaders.get(unit, self.cfg.pioreactor.leader_url)
+        if url not in self._leaders:
+            self._leaders[url] = LeaderAPI(url)
+        return self._leaders[url]
+
+    def leader_unit_for(self, unit: str) -> str:
+        if unit in self.cfg.pioreactor.leaders:
+            return unit
+        return self.cfg.pioreactor.leader_unit or unit
+
+    def list_units(self) -> dict[str, Any]:
+        """Every unit LARR-E knows: configured leaders, the default unit, and anything streaming telemetry."""
+        live = self._live_state()
+        names = set(live) | set(self.cfg.pioreactor.leaders)
+        if self.cfg.pioreactor.default_unit:
+            names.add(self.cfg.pioreactor.default_unit)
+        units = []
+        for u in sorted(names):
+            plan = self.plans.get(u)
+            units.append({
+                "unit": u,
+                "leader": self.cfg.pioreactor.leaders.get(u, self.cfg.pioreactor.leader_url),
+                "streaming": u in live,
+                "last_seen": live.get(u, {}).get("last_seen"),
+                "experiment": live.get(u, {}).get("experiment"),
+                "plan": plan.summary() + f" [{plan.status}]" if plan else None,
+            })
+        return {"units": units}
 
     # ------------------------------------------------------------------ MQTT
 
@@ -172,71 +212,18 @@ class PioreactorTools:
 
     def _set_attribute(self, unit: str, job: str, attr: str, value: Any) -> dict[str, Any]:
         exp = self.resolve_experiment(unit)
-        if self.cfg.pioreactor.pump_transport == "http":
-            if attr == "$state" and value == "disconnected":
-                return self._job_http("stop", unit, job, exp, None)
-            return self._job_http("update", unit, job, exp, {"settings": {attr: value}})
         return self._publish(f"pioreactor/{unit}/{exp}/{job}/{attr}/set", str(value))
 
     def _run_job(self, unit: str, job: str, options: dict[str, Any]) -> dict[str, Any]:
-        if self.cfg.pioreactor.pump_transport == "pios":
+        transport = self.cfg.pioreactor.pump_transport
+        if transport == "pios":
             return self._run_job_pios(unit, job, options)
-        if self.cfg.pioreactor.pump_transport == "http":
-            return self._job_http("run", unit, job, self.resolve_experiment(unit), {"options": options})
-        exp = self.resolve_experiment(unit)
-        payload = json.dumps({"options": options, "args": []})
-        return self._publish(f"pioreactor/{unit}/{exp}/run/{job}", payload)
-
-    # ------------------------------------------------------------------ leader web API
-
-    def _http_json(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
-        url = self.cfg.pioreactor.leader_url.rstrip("/") + path
-        data = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                return json.loads(response.read() or b"{}")
-        except urllib.error.HTTPError as exc:
-            raise ToolError(f"Pioreactor API {exc.code} on {path}: {exc.read()[:200].decode(errors='replace')}") from exc
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise ToolError(f"Pioreactor API unreachable at {url}: {exc}") from exc
-
-    def _await_task(self, task: dict[str, Any], seconds: float) -> dict[str, Any]:
-        """The leader queues work and returns a task; poll it so we report what actually happened."""
-        result_path, deadline = task.get("result_url_path"), time.monotonic() + seconds
-        while result_path and task.get("status") not in ("succeeded", "failed") and time.monotonic() < deadline:
-            time.sleep(0.5)
-            task = self._http_json("GET", result_path)
-        return task
-
-    def running_jobs(self, unit: str | None = None) -> set[str] | None:
-        """Names of jobs running on a unit, from the leader's web API (read-only). None if unknown."""
-        if self.cfg.pioreactor.pump_transport != "http":
-            return None
-        unit = self.resolve_unit(unit)
-        try:
-            task = self._await_task(self._http_json("GET", f"/api/workers/{urllib.parse.quote(unit)}/jobs/running"), 5)
-            jobs = task["result"][unit]["value"]
-            return {j["job_name"] for j in jobs if j.get("is_running")}
-        except (ToolError, KeyError, TypeError):
-            return None
-
-    def _job_http(self, action: str, unit: str, job: str, exp: str, body: dict[str, Any] | None) -> dict[str, Any]:
-        path = (f"/api/workers/{urllib.parse.quote(unit)}/jobs/{action}/job_name/{urllib.parse.quote(job)}"
-                f"/experiments/{urllib.parse.quote(exp)}")
-        record: dict[str, Any] = {"http": f"POST {path}", "body": body, "dry_run": self.dry_run}
-        if self.dry_run:
-            return record
-        task = self._await_task(self._http_json("POST", path, body), 8)
-        status = task.get("status")
-        per_unit = task.get("result") if isinstance(task.get("result"), dict) else {}
-        failures = [f"{u}: {r.get('error') or r}" for u, r in per_unit.items() if isinstance(r, dict) and not r.get("ok")]
-        if status == "failed" or failures:
-            raise ToolError(f"Pioreactor {action} {job} failed: {'; '.join(failures) or task}"[:300])
-        record["status"] = status or "accepted"
-        if status not in ("succeeded", "failed"):
-            record["note"] = "Accepted by the leader; still running after 8 s, check the Pioreactor UI."
-        return record
+        if transport in ("rest", "http"):  # "http" is the same transport under another name
+            return self._run_job_rest(unit, job, options)
+        raise ToolError(
+            f"LARRE_PUMP_TRANSPORT={transport!r} can't start jobs; use 'rest' (or 'pios' on the leader). "
+            "Pioreactor ignores the mqtt run/<job> topic, so a publish there would start nothing."
+        )
 
     def _run_job_pios(self, unit: str, job: str, options: dict[str, Any]) -> dict[str, Any]:
         cmd = ["pios", "run", job, "--units", unit, "-y"]
@@ -248,6 +235,23 @@ class PioreactorTools:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if proc.returncode != 0:
             raise ToolError(f"`{record['command']}` failed: {proc.stderr.strip() or proc.stdout.strip()}")
+        return record
+
+    def _run_job_rest(self, unit: str, job: str, options: dict[str, Any]) -> dict[str, Any]:
+        exp = self.resolve_experiment(unit)
+        record: dict[str, Any] = {"transport": "rest", "job": job, "experiment": exp, "dry_run": self.dry_run}
+        if self.dry_run:
+            return record
+        try:
+            response = self.leader_for(unit).run_job(unit, job, exp, options)
+        except LeaderAPIError as exc:
+            raise ToolError(str(exc)) from exc
+        # The leader accepts the request; only the per-unit result says whether the unit did it.
+        per_unit = response if isinstance(response, dict) else {}
+        refusals = [f"{u}: {r.get('error') or r}" for u, r in per_unit.items() if isinstance(r, dict) and r.get("ok") is False]
+        if refusals:
+            raise ToolError(f"Pioreactor did not start {job}: {'; '.join(refusals)}"[:300])
+        record["leader_response"] = response
         return record
 
     # ------------------------------------------------------------------ actuators
@@ -341,6 +345,136 @@ class PioreactorTools:
         result = self._set_attribute(unit, job, "$state", "disconnected")
         return {"ok": True, "unit": unit, "job": job, "state": "disconnected", **result}
 
+    # ------------------------------------------------------------------ experiment plans
+
+    def _build_plan(
+        self,
+        name: str,
+        duration_h: float,
+        temperature_c: float | None = None,
+        rpm: float | None = None,
+        od_reading: bool = True,
+        growth_rate: bool | None = None,
+        update_every_h: float | None = None,
+        unit: str | None = None,
+        notes: str = "",
+        requested_by: str = "",
+    ) -> ExperimentPlan:
+        unit = self.resolve_unit(unit)
+        plan = ExperimentPlan(
+            name=name,
+            unit=unit,
+            experiment=self.resolve_experiment(unit),
+            duration_h=float(duration_h),
+            temperature_c=None if temperature_c is None else float(temperature_c),
+            rpm=None if rpm is None else float(rpm),
+            od_reading=bool(od_reading),
+            growth_rate=bool(od_reading) if growth_rate is None else bool(growth_rate),
+            update_every_h=self.cfg.plans.default_update_every_h if update_every_h is None else float(update_every_h),
+            notes=notes,
+            requested_by=requested_by,
+        )
+        if plan.update_every_h and plan.update_every_h > plan.duration_h:
+            # A run shorter than one update interval gets a single update at the end, or none if very short.
+            plan.update_every_h = plan.duration_h if plan.duration_h >= 0.05 else None
+        try:
+            plan.validate(self.cfg)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+        return plan
+
+    def plan_experiment(self, **kwargs: Any) -> dict[str, Any]:
+        """Read-only preview: the plan and the Pioreactor profile it becomes. Changes nothing."""
+        plan = self._build_plan(**kwargs)
+        current = self.plans.get(plan.unit)
+        return {
+            "plan": plan.public(),
+            "profile_yaml": plan.to_profile_yaml(),
+            "conflict": current.summary() if current and current.status == "running" else None,
+        }
+
+    def start_experiment(self, check_only: bool = False, **kwargs: Any) -> dict[str, Any]:
+        """Upload the profile to the leader and execute it. Pioreactor then owns the schedule."""
+        plan = self._build_plan(**kwargs)
+        current = self.plans.get(plan.unit)
+        if current and current.status == "running":
+            raise ToolError(
+                f"{plan.unit} already runs '{current.summary()}'. Stop it with stop_experiment first: "
+                "two profiles driving the same jobs interfere with each other."
+            )
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True, "plan": plan.public()}
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        plan.profile_filename = f"{plan.profile_name()}-{stamp}.yaml"
+        yaml_body = plan.to_profile_yaml()
+        leader, leader_unit = self.leader_for(plan.unit), self.leader_unit_for(plan.unit)
+        full_path = f"{self.cfg.pioreactor.profile_dir.rstrip('/')}/{plan.profile_filename}"
+        record: dict[str, Any] = {"dry_run": self.dry_run, "profile_path_on_leader": full_path}
+        if not self.dry_run:
+            try:
+                leader.upload_profile(plan.profile_filename, yaml_body)
+            except LeaderAPIError as exc:
+                raise ToolError(f"The leader rejected the profile: {exc}") from exc
+            try:
+                record["leader_response"] = leader.run_profile(leader_unit, full_path, plan.experiment)
+            except LeaderAPIError as exc:
+                plan.status = "failed"
+                self.plans.put(plan)
+                raise ToolError(f"Profile uploaded but did not start: {exc}") from exc
+        plan.status = "running"
+        plan.started_at = utc_timestamp()
+        self.plans.put(plan)
+        return {"ok": True, "plan": plan.public(), "profile_yaml": yaml_body, **record}
+
+    def get_experiment_plan(self, unit: str | None = None) -> dict[str, Any]:
+        if unit:
+            plan = self.plans.get(self.resolve_unit(unit))
+            return {"plan": plan.public() if plan else None}
+        return {"plans": [p.public() for p in self.plans.all()]}
+
+    def stop_experiment(self, unit: str | None = None, check_only: bool = False) -> dict[str, Any]:
+        """Stop the running profile and the jobs it started, before its scheduled end."""
+        unit = self.resolve_unit(unit)
+        plan = self.plans.get(unit)
+        if not plan or plan.status != "running":
+            raise ToolError(f"No running experiment plan on {unit}.")
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
+        stopped, errors = [], []
+        if not self.dry_run:
+            leader = self.leader_for(unit)
+            # Stop only this plan's profile. Stopping job_name=experiment_profile would stop every
+            # profile in the experiment, including other units' plans.
+            try:
+                job_id = leader.find_profile_run(plan.experiment, plan.profile_filename or "")
+                if job_id is not None:
+                    leader.stop_job_id(job_id)
+                    stopped.append(f"experiment_profile#{job_id}")
+                else:
+                    errors.append("profile run not found on the leader (already finished, or started elsewhere)")
+            except LeaderAPIError as exc:
+                errors.append(f"experiment_profile: {exc}")
+            # Killing a profile stops the jobs it started; stopping them explicitly as well is harmless.
+            for target, job in [(unit, job) for job in plan.jobs()]:
+                try:
+                    leader.stop_job(target, job, plan.experiment)
+                    stopped.append(job)
+                except LeaderAPIError as exc:
+                    errors.append(f"{job}: {exc}")
+        plan.status, plan.ended_at = "stopped", utc_timestamp()
+        self.plans.put(plan)
+        return {"ok": not errors, "unit": unit, "stopped": stopped, "errors": errors, "dry_run": self.dry_run}
+
+    def active_plan_context(self, unit: str | None) -> dict[str, Any] | None:
+        """Expected state for the agent and triage; None when there is no plan."""
+        try:
+            plan = self.plans.get(self.resolve_unit(unit))
+        except ToolError:
+            return None
+        if not plan:
+            return None
+        return {"summary": plan.summary(), "status": plan.status, **plan.expected_state()}
+
     # ------------------------------------------------------------------ SQLite
 
     def _connect_ro(self) -> sqlite3.Connection:
@@ -397,7 +531,7 @@ class PioreactorTools:
             raise ToolError(f"metric must be one of {sorted(METRIC_TABLES)}")
         experiment = experiment or self.resolve_experiment(unit)
         attempts: list[str] = []
-        if self.cfg.pioreactor.pump_transport == "http" and metric in LEADER_SERIES:
+        if self.cfg.pioreactor.pump_transport in ("rest", "http") and metric in LEADER_SERIES:
             try:
                 series = self._leader_series(metric, unit, minutes, experiment)
                 if series.values:
@@ -417,9 +551,13 @@ class PioreactorTools:
         return Series(metric, unit, experiment, [], []), "no data (" + "; ".join(attempts) + ")"
 
     def _leader_series(self, metric: str, unit: str, minutes: float, experiment: str) -> Series:
-        path = (f"/api/experiments/{urllib.parse.quote(experiment)}/time_series/{LEADER_SERIES[metric]}"
+        path = (f"/api/experiments/{quote(experiment)}/time_series/{LEADER_SERIES[metric]}"
                 f"?lookback={minutes / 60:.4f}")  # lookback is in hours
-        data = self._http_json("GET", path)
+        try:
+            data = self.leader_for(unit).call("GET", path)
+        except LeaderAPIError as exc:
+            raise ToolError(str(exc)) from exc
+        data = data if isinstance(data, dict) else {}
         names, points = data.get("series", []), data.get("data", [])
         rows = points[names.index(unit)] if unit in names and names.index(unit) < len(points) else []
         rows = sorted(rows, key=lambda p: p["x"])

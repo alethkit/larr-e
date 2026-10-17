@@ -21,6 +21,7 @@ import logging
 import re
 import sys
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
@@ -51,6 +52,8 @@ ACTION_TITLES = {
     "set_stirring_rpm": "Change stirring speed",
     "start_job": "Start a job",
     "stop_job": "Stop a job",
+    "start_experiment": "Start an experiment",
+    "stop_experiment": "Stop an experiment early",
 }
 
 HELP_TEXT = """*LARR-E*: talk to your Pioreactor cluster.
@@ -58,6 +61,9 @@ HELP_TEXT = """*LARR-E*: talk to your Pioreactor cluster.
 • `/larr-e alerts`: recent anomaly alerts
 • `/larr-e plot the last 10 minutes of OD against temperature`
 • `/larr-e pump 1ml of media into worker1`: asks for approval before touching hardware
+• `/larr-e run the vial at 37C and 180 rpm for 18 hours, update me every 2 hours`
+• `/larr-e experiment`: the running experiment plan (no AI)
+• `/larr-e units`: every unit in the cluster, real and digital twin (no AI)
 Or @mention me in a channel, or DM me. Reply in my thread to keep the conversation going."""
 
 
@@ -173,6 +179,7 @@ class LarreBot:
         conv = self.conversation(channel, thread_ts)
         with conv.lock:  # one question at a time per thread
             conv.requester = user
+            conv.agent.requester = user
             conv.tool_log = []
             conv.status_ts = self.client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts, text=":brain: working on it…"
@@ -203,6 +210,12 @@ class LarreBot:
             )
         if name == "plot_timeseries" and not is_error:
             self.upload_plot(conv.channel, conv.thread_ts, result)
+        if name == "start_experiment" and not is_error and result.get("ok"):
+            # Progress updates for this plan go to the thread that started it.
+            plan = self.tools.plans.get(result["plan"]["unit"])
+            if plan:
+                plan.slack_channel, plan.slack_thread_ts = conv.channel, conv.thread_ts
+                self.tools.plans.put(plan)
 
     def upload_plot(self, channel: str, thread_ts: str | None, result: dict[str, Any], note: str = "") -> None:
         caption = f"`{result['unit']}`{note}"
@@ -235,6 +248,7 @@ class LarreBot:
         summary = f":warning: *{ACTION_TITLES.get(tool, tool)}*{dry}\n`{tool}` {format_args(args)}"
         blocks = [
             {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
+            *self._plan_preview_blocks(tool, args),
             {
                 "type": "context",
                 "elements": [{"type": "mrkdwn", "text": f"Requested by <@{conv.requester}> · needs {who}"}],
@@ -276,6 +290,20 @@ class LarreBot:
             )
         self.audit(pending, "approved" if pending.approved else ("denied" if decided else "expired"))
         return pending.approved
+
+    def _plan_preview_blocks(self, tool: str, args: dict[str, Any]) -> list[dict[str, Any]]:
+        """For start_experiment, show the plan and the exact profile the approver is agreeing to."""
+        if tool != "start_experiment":
+            return []
+        try:
+            preview = self.tools.plan_experiment(**args)
+        except (ToolError, TypeError) as exc:
+            return [{"type": "section", "text": {"type": "mrkdwn", "text": f":x: Plan is invalid: {exc}"}}]
+        plan = preview["plan"]
+        text = f"*{plan['summary']}*\nPioreactor profile (it runs the schedule and stops the jobs at the end):\n```{preview['profile_yaml']}```"
+        if preview["conflict"]:
+            text += f"\n:warning: Already running: {preview['conflict']}"
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}]
 
     def decide(self, approval_id: str, user: str, approve: bool) -> str | None:
         """Apply a button click. Returns an error to show the clicker privately, or None on success."""
@@ -386,6 +414,74 @@ class LarreBot:
             return
         self.upload_plot(channel, ts, result, note=f" · requested by <@{user}>")
 
+    # ------------------------------------------------------------ experiment progress
+
+    def _update_target(self, plan: Any) -> tuple[str, str | None] | None:
+        if plan.slack_channel:
+            return plan.slack_channel, plan.slack_thread_ts
+        channel = self.cfg.plans.update_channel or self.cfg.slack.alert_channel
+        return (channel, None) if channel else None
+
+    def progress_text(self, plan: Any, final: bool = False) -> str:
+        elapsed = min(plan.elapsed_h() or 0.0, plan.duration_h)
+        if final:
+            head = f":checkered_flag: *{plan.name}* finished after {plan.duration_h:g} h. Pioreactor stopped its jobs on schedule."
+        else:
+            head = f":test_tube: *{plan.name}*: {elapsed:.1f} h of {plan.duration_h:g} h ({plan.duration_h - elapsed:.1f} h left)"
+        live = self.tools.get_live_status(plan.unit) if plan.unit in self.tools._live_state() else {}
+        s = live.get(plan.unit, {})
+        bits = []
+        if "temperature" in s:
+            tgt = f" (target {plan.temperature_c:g})" if plan.temperature_c is not None else ""
+            bits.append(f"temp {s['temperature']['value']:.1f} °C{tgt}")
+        if "stirring" in s:
+            tgt = f" (target {plan.rpm:g})" if plan.rpm is not None else ""
+            bits.append(f"stirring {s['stirring']['value']:.0f} rpm{tgt}")
+        if s.get("od"):
+            bits.append("OD " + ", ".join(f"{v['value']:.3f}" for _, v in sorted(s["od"].items())))
+        if "growth_rate" in s:
+            bits.append(f"growth {s['growth_rate']['value']:.3f} h⁻¹")
+        return head + ("\n" + " · ".join(bits) if bits else "\n_(no live telemetry: is `larr-e listen` running?)_")
+
+    def post_progress(self, plan: Any, final: bool = False) -> None:
+        target = self._update_target(plan)
+        if not target:
+            log.warning("Progress update for %s due, but no Slack channel is known", plan.unit)
+            return
+        channel, thread_ts = target
+        self.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=self.progress_text(plan, final))
+        minutes = max(1.0, min(plan.elapsed_h() or 0.0, plan.duration_h) * 60)
+        for metrics in (["od", "growth_rate"], ["od", "temperature"]):
+            try:
+                result = self.tools.plot_timeseries(metrics, plan.unit, minutes=minutes)
+            except ToolError:
+                continue  # e.g. no growth rate yet early on; fall back to OD vs temperature
+            self.upload_plot(channel, thread_ts, result, note=f" · {plan.name}")
+            break
+
+    def check_plans(self) -> None:
+        """One pass: post due updates and the end-of-experiment message. Runs no LLM."""
+        for plan in self.tools.plans.all():
+            if plan.status == "finished" and not plan.final_posted:
+                self.post_progress(plan, final=True)
+                plan.final_posted = True
+                self.tools.plans.put(plan)
+            elif plan.update_due():
+                self.post_progress(plan)
+                plan.last_update_at = utc_timestamp()
+                self.tools.plans.put(plan)
+
+    def start_progress_loop(self) -> None:
+        def loop() -> None:
+            while True:
+                try:
+                    self.check_plans()
+                except Exception:
+                    log.exception("Progress check failed")
+                time.sleep(self.cfg.plans.check_every_s)
+
+        threading.Thread(target=loop, name="larre-progress", daemon=True).start()
+
     def start_mqtt(self) -> None:
         m = self.cfg.mqtt
         client = build_client(self.cfg, role="slackbot")
@@ -450,6 +546,22 @@ class LarreBot:
                 ack()
                 respond(text=format_status(self.tools.get_live_status()), response_type="in_channel")
                 return
+            if text.lower() in {"units", "cluster"}:
+                ack()
+                rows = self.tools.list_units()["units"]
+                lines = [
+                    f"• `{u['unit']}` {':large_green_circle:' if u['streaming'] else ':white_circle:'} "
+                    f"{u['experiment'] or '—'} · {u['plan'] or 'no plan'} · _{u['leader']}_"
+                    for u in rows
+                ] or ["No units known yet."]
+                respond(text="*Cluster*\n" + "\n".join(lines), response_type="in_channel")
+                return
+            if text.lower() in {"experiment", "plan"}:
+                ack()
+                plans = [p for p in self.tools.plans.all() if p.status == "running"]
+                msg = "\n\n".join(self.progress_text(p) for p in plans) or "No experiment is running."
+                respond(text=msg, response_type="in_channel")
+                return
             if text.lower() == "alerts":
                 ack()
                 alerts = self.tools.list_recent_alerts(8)["alerts"]
@@ -495,6 +607,7 @@ def run(cfg: Settings = default_settings) -> None:
     cfg.ensure_dirs()
     bot = LarreBot(cfg)
     bot.start_mqtt()
+    bot.start_progress_loop()
     log.info("LARR-E bot online as %s (dry_run=%s)", bot.bot_user_id, bot.tools.dry_run)
     SocketModeHandler(bot.app, cfg.slack.app_token).start()
 

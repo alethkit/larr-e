@@ -3,7 +3,7 @@
     larr-e exec  "pump 1ml of media into worker1"
     larr-e query "plot the last 10 minutes of OD against temperature"
     larr-e chat
-    larr-e listen | status | alerts | slack | api
+    larr-e listen | status | alerts | slack | api | twin
 """
 
 from __future__ import annotations
@@ -32,6 +32,9 @@ through the tools you are given.
 
 How the cluster works:
 - Each Pioreactor is a "unit" (e.g. worker1). Telemetry and commands flow over MQTT on the leader.
+- The cluster can mix real units and digital-twin units (simulated, named e.g. twin1). They behave the
+  same through your tools; when you report on a twin, say it is simulated.
+- With more than one unit, a hardware request that doesn't name a unit is ambiguous: ask.
 - Pumps: "media" adds fresh media, "waste" removes culture, "alt_media" adds alternative media.
 - Temperature is held by the thermostat temperature automation; stirring by the stirring job.
 - Growth rate is in h^-1; OD is unitless optical density.
@@ -154,6 +157,13 @@ EXPERIMENT_PROPS = {
 }
 
 READ_TOOLS += [
+    _tool(
+        "list_units",
+        "Every Pioreactor unit LARR-E can see, real or digital twin: which leader controls it, whether it "
+        "is streaming telemetry, its experiment and its experiment plan. Use it for cluster-wide questions.",
+        {},
+        [],
+    ),
     _tool(
         "plan_experiment",
         "Preview an experiment without starting it: returns the plan and the Pioreactor experiment profile "
@@ -281,6 +291,7 @@ class LarreAgent:
             "set_stirring_rpm": t.set_stirring_rpm,
             "start_job": t.start_job,
             "stop_job": t.stop_job,
+            "list_units": t.list_units,
             "plan_experiment": t.plan_experiment,
             "get_experiment_plan": t.get_experiment_plan,
             "start_experiment": t.start_experiment,
@@ -496,6 +507,16 @@ def api_cmd(host: str | None, port: int | None) -> None:
     import api_server
 
     api_server.run(host=host, port=port)
+
+
+@cli.command("twin", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.pass_context
+def twin_cmd(ctx: click.Context) -> None:
+    """Run the digital-twin cluster (virtual Pioreactors). Options: see `python twin.py --help`."""
+    import twin
+
+    sys.argv = ["twin.py", *ctx.args]
+    twin.main()
 
 
 @cli.command("slack")

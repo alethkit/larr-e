@@ -9,6 +9,8 @@ Endpoints used (checked against Pioreactor 26.11 source, core/pioreactor/web/api
     POST /api/workers/<unit>/jobs/stop/job_name/<job>/experiments/<exp>
     POST /api/experiment_profiles                      {"filename", "body"}
     GET  /api/experiments/<exp>/experiment_profiles/running
+    GET  /api/workers/<unit>/experiment                 the experiment the unit is assigned to
+    POST /unit_api/jobs/stop                           {"job_id": ...}  (core/pioreactor/web/unit_api.py)
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ class LeaderAPI:
 
     # ------------------------------------------------------------------ transport
 
-    def _request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+    def _request(self, method: str, path: str, body: Any = None, timeout_s: float | None = None) -> tuple[int, Any]:
         data = None if body is None else json.dumps(body).encode()
         req = urllib.request.Request(
             self.base_url + path,
@@ -42,7 +44,7 @@ class LeaderAPI:
             headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            with urllib.request.urlopen(req, timeout=timeout_s or self.timeout_s) as resp:
                 raw = resp.read()
                 return resp.status, (json.loads(raw) if raw else None)
         except urllib.error.HTTPError as exc:
@@ -95,6 +97,17 @@ class LeaderAPI:
         path = f"/api/workers/{quote(unit, safe='')}/jobs/stop/job_name/{quote(job, safe='')}/experiments/{quote(experiment, safe='')}"
         return self.call("POST", path, {})
 
+    def assigned_experiment(self, unit: str) -> str | None:
+        """The experiment the leader has this worker assigned to; None if unknown or unreachable.
+
+        Jobs can only run in the assigned experiment, so this beats any guess from config or data.
+        """
+        try:
+            status, content = self._request("GET", f"/api/workers/{quote(unit, safe='')}/experiment", timeout_s=3)
+        except LeaderAPIError:
+            return None
+        return content.get("experiment") if isinstance(content, dict) else None
+
     # ------------------------------------------------------------------ experiment profiles
 
     def upload_profile(self, filename: str, yaml_body: str) -> Any:
@@ -107,7 +120,20 @@ class LeaderAPI:
         return self.run_job(leader_unit, "experiment_profile", experiment, options, ["execute", filename, experiment])
 
     def stop_profiles(self, leader_unit: str, experiment: str) -> Any:
+        """Stops EVERY profile running in the experiment, on any unit. Prefer stop_profile_run."""
         return self.stop_job(leader_unit, "experiment_profile", experiment)
+
+    def find_profile_run(self, experiment: str, profile_filename: str) -> int | None:
+        """job_id of the running profile started from this file, if any."""
+        for run in self.running_profiles(experiment) or []:
+            settings = run.get("settings") or {}
+            if settings.get("profile_filename") == profile_filename:
+                return int(run["job_id"])
+        return None
+
+    def stop_job_id(self, job_id: int) -> Any:
+        """Stop one job by id on the leader (unit API), leaving other profiles alone."""
+        return self.call("POST", "/unit_api/jobs/stop", {"job_id": int(job_id)})
 
     def running_profiles(self, experiment: str) -> Any:
         return self.call("GET", f"/api/experiments/{quote(experiment, safe='')}/experiment_profiles/running")

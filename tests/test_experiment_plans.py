@@ -56,6 +56,13 @@ class FakeLeader:
                 outer.requests.append(("GET", self.path, None))
                 if self.path.startswith("/unit_api/task_results/"):
                     self._reply(200, {"task_id": "t1", "status": "succeeded", "result": {"ran": True}})
+                elif self.path.endswith("/experiment_profiles/running"):
+                    runs = [{"job_name": "experiment_profile", "job_id": 41, "settings": {"profile_filename": "someone-elses.yaml"}}]
+                    runs += [{"job_name": "experiment_profile", "job_id": 42 + i, "settings": {"profile_filename": f}}
+                             for i, f in enumerate(outer.profiles)]
+                    self._reply(200, runs)
+                elif self.path.endswith("/experiment"):
+                    self._reply(404, {"error": "not assigned"})  # fall back to configured experiment
                 else:
                     self._reply(200, [])
 
@@ -186,9 +193,10 @@ def test_start_and_stop_experiment(tmp_path, leader):
 
     stopped = tools.stop_experiment()
     assert stopped["ok"], stopped
-    stop_paths = [p for p, _ in leader.posts() if "/jobs/stop/" in p]
-    assert stop_paths[0].endswith("/job_name/experiment_profile/experiments/demo")
-    assert any("/job_name/stirring/" in p for p in stop_paths)
+    # only this plan's profile is stopped (by job id), never every profile in the experiment
+    assert ("/unit_api/jobs/stop", {"job_id": 42}) in leader.posts()
+    assert not any("/jobs/stop/job_name/experiment_profile/" in p for p, _ in leader.posts())
+    assert any("/jobs/stop/job_name/stirring/" in p for p, _ in leader.posts())
     assert tools.plans.get("pio1").status == "stopped"
 
 

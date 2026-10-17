@@ -33,6 +33,8 @@ act on the hardware in plain English, with hard safety limits and a human confir
 | `pocket3ds/` | Native Nintendo 3DS app (PocketJS) and the bridge that pairs it with the API. See [pocket3ds/README.md](pocket3ds/README.md) |
 | `experiment.py` | Experiment plans: request → Pioreactor experiment profile YAML, persisted plan, expected state, update timing |
 | `leader_api.py` | Small client for the leader's REST API: start/stop jobs, upload and run profiles |
+| `twin.py` | Digital twin: virtual Pioreactors with a growth/thermal model, the same REST and MQTT interfaces, and injectable faults (`larr-e twin`) |
+| `schema.py` | The Pioreactor SQLite tables LARR-E reads, shared by the recorder and the demo injector |
 | `inject_anomaly.py` | Demo helper that publishes Pioreactor-format fake telemetry to trigger alerts on cue |
 
 ---
@@ -106,6 +108,43 @@ Run the agent **on the leader** to get direct DB access. To run it from a laptop
 first (`scp pioreactor@pioreactor.local:.pioreactor/storage/pioreactor.sqlite ./runtime/`) and point
 `LARRE_DB_PATH` at the copy.
 
+### Digital twin and mixed clusters
+
+`twin.py` runs virtual Pioreactors on a laptop. Each one has a thermostat that heats toward its
+setpoint (it can't cool below ambient), stirring that ramps to its target, logistic growth that
+depends on temperature and stirring, and pumps that dilute. The twin answers on the same REST
+paths and MQTT topics as a real leader, so LARR-E drives it with the same code, profiles
+included. Biology runs 10× faster by default (`--bio-speed`), but schedules run in real time.
+
+Pioreactor's own test mode is not a twin. Its mock hardware keeps OD flat, fakes temperature as a
+sine wave around 25 °C whatever the heater does, and always reports the initial RPM.
+
+```bash
+larr-e twin --units twin1,twin2 --experiment larre-demo --mqtt-host 127.0.0.1 --port 8790   # terminal 1
+export LARRE_MQTT_HOST=127.0.0.1 LARRE_PUMP_TRANSPORT=rest LARRE_RECORD_DB=1 \
+       LARRE_DB_PATH=./runtime/cluster.sqlite \
+       LARRE_LEADERS="twin1=http://127.0.0.1:8790,twin2=http://127.0.0.1:8790"
+larr-e listen                                                # terminal 2: alerts + records history
+larr-e exec "run twin1 at 37 degrees and 180 rpm for 10 minutes, update me every 3 minutes"
+curl -X POST localhost:8790/twin/fault -d '{"unit":"twin1","fault":"stir_stall"}'     # trip an alert
+curl localhost:8790/twin/state                               # ground truth, for checking LARR-E
+```
+
+Faults: `heater_fail`, `stir_stall`, `bubble` (one OD spike), `contamination` (growth jumps),
+`vial_removed` (OD to zero), and `clear` to remove them all.
+
+**Adding the real Pi.** Point MQTT at the Pi's broker (`LARRE_MQTT_HOST=pioreactor.local`, plus
+credentials) and start the twin with the same `--mqtt-host`, so both report in one place. Leave
+the Pi's unit out of `LARRE_LEADERS`; it uses `LARRE_LEADER_URL`. Leave `LARRE_EXPERIMENT` unset:
+LARR-E asks each unit's leader which experiment the unit is assigned to. `/larr-e units` lists
+every unit, real and twin. Caveat: the Pi's `mqtt_to_db_streaming` may also store the twin's
+readings in the Pi's database, so give the twin its own experiment name.
+
+**Profiles and shared experiments.** On Pioreactor, stopping `experiment_profile` through the
+leader stops every profile in the experiment. `stop_experiment` therefore finds its own run by
+`profile_filename` and stops it by `job_id`, leaving other units' plans running. The twin copies
+Pioreactor's behaviour so the tests would catch a regression.
+
 ### Rehearse with no hardware
 ```bash
 docker run -d --name mqtt -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
@@ -161,7 +200,9 @@ LARR-E keeps the plan in `runtime/experiment_plans.json` (one per unit, survives
 LARR-E refuses to start a second plan on a unit that already has one running. Pioreactor's own
 profile dry-run executes in real time, so we don't use it as a pre-flight check.
 
-Tests: `pytest tests/` (no hardware, Slack or API key). To also check the generated profile
+Tests: `pytest tests/` (no hardware, Slack or API key). `tests/test_twin_cluster.py` runs a real
+MQTT broker, a two-unit twin, the listener and the tools end to end (about 50 s; needs
+`mosquitto` or `pip install amqtt`). To also check the generated profile
 against Pioreactor's own schema validator, clone `Pioreactor/pioreactor` and run with
 `PYTHONPATH=pioreactor/core GLOBAL_CONFIG=pioreactor/config.dev.ini TESTING=1`.
 

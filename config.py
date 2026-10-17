@@ -83,6 +83,17 @@ class PioreactorConfig:
     leader_url: str = _env("LARRE_LEADER_URL", "http://pioreactor.local")
     # Leader's unit name: experiment profiles execute on the leader. In a one-Pi cluster it is the worker too.
     leader_unit: str | None = _env("LARRE_LEADER_UNIT")
+    # Units served by a different leader, e.g. digital-twin units next to the real Pi:
+    #   LARRE_LEADERS="twin1=http://127.0.0.1:8790,twin2=http://127.0.0.1:8790"
+    # A unit listed here is its own leader. Unlisted units use leader_url / leader_unit.
+    leaders: dict[str, str] = field(
+        default_factory=lambda: dict(
+            pair.split("=", 1) for pair in (_env("LARRE_LEADERS", "") or "").replace(" ", "").split(",") if "=" in pair
+        )
+    )
+    # Record every telemetry reading the listener sees into db_path (Pioreactor schema). Use this
+    # when LARR-E runs on a laptop: the leader's own database lives on the Pi, and twin units have none.
+    record_db: bool = _env_bool("LARRE_RECORD_DB", False)
     # Where the leader keeps profiles (the execute command needs the full path on the leader).
     profile_dir: str = _env("LARRE_PROFILE_DIR", "/home/pioreactor/.pioreactor/experiment_profiles")
     dry_run: bool = _env_bool("LARRE_DRY_RUN", False)

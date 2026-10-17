@@ -99,7 +99,7 @@ class PioreactorTools:
         self.cfg = cfg
         self.dry_run = cfg.pioreactor.dry_run if dry_run is None else dry_run
         self.render_terminal = render_terminal
-        self.leader = LeaderAPI(cfg.pioreactor.leader_url)
+        self._leaders: dict[str, LeaderAPI] = {}
         self.plans = PlanStore(cfg.output.plans_path)
         cfg.ensure_dirs()
 
@@ -118,21 +118,64 @@ class PioreactorTools:
         )
 
     def resolve_experiment(self, unit: str | None = None) -> str:
-        if self.cfg.pioreactor.experiment:
-            return self.cfg.pioreactor.experiment
+        # In a mixed cluster (real Pi + twin) units run different experiments, so what a unit is
+        # actually streaming wins over the global setting.
         state = self._live_state()
         if unit and unit in state and state[unit].get("experiment"):
             return state[unit]["experiment"]
+        if unit and not self.dry_run:
+            assigned = self.leader_for(unit).assigned_experiment(unit)
+            if assigned:
+                return assigned
+        if self.cfg.pioreactor.experiment:
+            return self.cfg.pioreactor.experiment
         try:
             with self._connect_ro() as conn:
-                row = conn.execute(
+                row = None
+                if unit:
+                    row = conn.execute(
+                        "SELECT experiment FROM od_readings WHERE pioreactor_unit = ? ORDER BY timestamp DESC LIMIT 1",
+                        (unit,),
+                    ).fetchone()
+                row = row or conn.execute(
                     "SELECT experiment FROM experiments ORDER BY created_at DESC LIMIT 1"
                 ).fetchone()
-        except ToolError:
+        except (ToolError, sqlite3.DatabaseError):
             row = None
         if row:
             return row[0]
         raise ToolError("Could not determine the active experiment; set LARRE_EXPERIMENT.")
+
+    def leader_for(self, unit: str) -> LeaderAPI:
+        """The REST API that controls this unit: its own (twin) leader if mapped, else the main leader."""
+        url = self.cfg.pioreactor.leaders.get(unit, self.cfg.pioreactor.leader_url)
+        if url not in self._leaders:
+            self._leaders[url] = LeaderAPI(url)
+        return self._leaders[url]
+
+    def leader_unit_for(self, unit: str) -> str:
+        if unit in self.cfg.pioreactor.leaders:
+            return unit
+        return self.cfg.pioreactor.leader_unit or unit
+
+    def list_units(self) -> dict[str, Any]:
+        """Every unit LARR-E knows: configured leaders, the default unit, and anything streaming telemetry."""
+        live = self._live_state()
+        names = set(live) | set(self.cfg.pioreactor.leaders)
+        if self.cfg.pioreactor.default_unit:
+            names.add(self.cfg.pioreactor.default_unit)
+        units = []
+        for u in sorted(names):
+            plan = self.plans.get(u)
+            units.append({
+                "unit": u,
+                "leader": self.cfg.pioreactor.leaders.get(u, self.cfg.pioreactor.leader_url),
+                "streaming": u in live,
+                "last_seen": live.get(u, {}).get("last_seen"),
+                "experiment": live.get(u, {}).get("experiment"),
+                "plan": plan.summary() + f" [{plan.status}]" if plan else None,
+            })
+        return {"units": units}
 
     # ------------------------------------------------------------------ MQTT
 
@@ -188,7 +231,7 @@ class PioreactorTools:
         if self.dry_run:
             return record
         try:
-            record["leader_response"] = self.leader.run_job(unit, job, exp, options)
+            record["leader_response"] = self.leader_for(unit).run_job(unit, job, exp, options)
         except LeaderAPIError as exc:
             raise ToolError(str(exc)) from exc
         return record
@@ -297,7 +340,8 @@ class PioreactorTools:
             requested_by=requested_by,
         )
         if plan.update_every_h and plan.update_every_h > plan.duration_h:
-            plan.update_every_h = plan.duration_h
+            # A run shorter than one update interval gets a single update at the end, or none if very short.
+            plan.update_every_h = plan.duration_h if plan.duration_h >= 0.05 else None
         try:
             plan.validate(self.cfg)
         except ValueError as exc:
@@ -326,16 +370,16 @@ class PioreactorTools:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         plan.profile_filename = f"{plan.profile_name()}-{stamp}.yaml"
         yaml_body = plan.to_profile_yaml()
-        leader_unit = self.cfg.pioreactor.leader_unit or plan.unit
+        leader, leader_unit = self.leader_for(plan.unit), self.leader_unit_for(plan.unit)
         full_path = f"{self.cfg.pioreactor.profile_dir.rstrip('/')}/{plan.profile_filename}"
         record: dict[str, Any] = {"dry_run": self.dry_run, "profile_path_on_leader": full_path}
         if not self.dry_run:
             try:
-                self.leader.upload_profile(plan.profile_filename, yaml_body)
+                leader.upload_profile(plan.profile_filename, yaml_body)
             except LeaderAPIError as exc:
                 raise ToolError(f"The leader rejected the profile: {exc}") from exc
             try:
-                record["leader_response"] = self.leader.run_profile(leader_unit, full_path, plan.experiment)
+                record["leader_response"] = leader.run_profile(leader_unit, full_path, plan.experiment)
             except LeaderAPIError as exc:
                 plan.status = "failed"
                 self.plans.put(plan)
@@ -359,12 +403,22 @@ class PioreactorTools:
             raise ToolError(f"No running experiment plan on {unit}.")
         stopped, errors = [], []
         if not self.dry_run:
-            leader_unit = self.cfg.pioreactor.leader_unit or unit
+            leader = self.leader_for(unit)
+            # Stop only this plan's profile. Stopping job_name=experiment_profile would stop every
+            # profile in the experiment, including other units' plans.
+            try:
+                job_id = leader.find_profile_run(plan.experiment, plan.profile_filename or "")
+                if job_id is not None:
+                    leader.stop_job_id(job_id)
+                    stopped.append(f"experiment_profile#{job_id}")
+                else:
+                    errors.append("profile run not found on the leader (already finished, or started elsewhere)")
+            except LeaderAPIError as exc:
+                errors.append(f"experiment_profile: {exc}")
             # Killing a profile stops the jobs it started; stopping them explicitly as well is harmless.
-            calls = [(leader_unit, "experiment_profile")] + [(unit, job) for job in plan.jobs()]
-            for target, job in calls:
+            for target, job in [(unit, job) for job in plan.jobs()]:
                 try:
-                    self.leader.stop_job(target, job, plan.experiment)
+                    leader.stop_job(target, job, plan.experiment)
                     stopped.append(job)
                 except LeaderAPIError as exc:
                     errors.append(f"{job}: {exc}")

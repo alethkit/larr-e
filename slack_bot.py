@@ -62,6 +62,7 @@ HELP_TEXT = """*LARR-E*: talk to your Pioreactor cluster.
 • `/larr-e pump 1ml of media into worker1`: asks for approval before touching hardware
 • `/larr-e run the vial at 37C and 180 rpm for 18 hours, update me every 2 hours`
 • `/larr-e experiment`: the running experiment plan (no AI)
+• `/larr-e units`: every unit in the cluster, real and digital twin (no AI)
 Or @mention me in a channel, or DM me. Reply in my thread to keep the conversation going."""
 
 
@@ -541,6 +542,16 @@ class LarreBot:
             if text.lower() == "status":
                 ack()
                 respond(text=format_status(self.tools.get_live_status()), response_type="in_channel")
+                return
+            if text.lower() in {"units", "cluster"}:
+                ack()
+                rows = self.tools.list_units()["units"]
+                lines = [
+                    f"• `{u['unit']}` {':large_green_circle:' if u['streaming'] else ':white_circle:'} "
+                    f"{u['experiment'] or '—'} · {u['plan'] or 'no plan'} · _{u['leader']}_"
+                    for u in rows
+                ] or ["No units known yet."]
+                respond(text="*Cluster*\n" + "\n".join(lines), response_type="in_channel")
                 return
             if text.lower() in {"experiment", "plan"}:
                 ack()

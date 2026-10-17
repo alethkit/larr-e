@@ -40,6 +40,7 @@ class FakeLeader:
         self.profiles: dict[str, str] = {}
         self.reject_upload: str | None = None
         self.task_result: object = {"ran": True}
+        self.running: list[str] = []  # job names GET /api/workers/<unit>/jobs/running reports
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -63,6 +64,10 @@ class FakeLeader:
                     runs += [{"job_name": "experiment_profile", "job_id": 42 + i, "settings": {"profile_filename": f}}
                              for i, f in enumerate(outer.profiles)]
                     self._reply(200, runs)
+                elif self.path.endswith("/jobs/running"):
+                    unit = self.path.split("/")[3]
+                    jobs = [{"job_name": j, "is_running": 1} for j in outer.running]
+                    self._reply(200, {unit: {"ok": True, "value": jobs}})
                 elif self.path.endswith("/experiment"):
                     self._reply(404, {"error": "not assigned"})  # fall back to configured experiment
                 else:

@@ -214,6 +214,25 @@ class PioreactorTools:
         exp = self.resolve_experiment(unit)
         return self._publish(f"pioreactor/{unit}/{exp}/{job}/{attr}/set", str(value))
 
+    def _change_or_start(self, unit: str, job: str, attr: str, value: Any, start_options: dict[str, Any]) -> dict[str, Any]:
+        """Change a running job's setting; if the job isn't running, start it with that setting.
+
+        A setting published over MQTT to a job that isn't running reaches no one, yet looks like
+        success: on 17 Oct an approved "stir at 200 rpm" changed nothing because stirring was off.
+        """
+        if self.dry_run or self.cfg.pioreactor.pump_transport not in ("rest", "http"):
+            return self._set_attribute(unit, job, attr, value)
+        try:
+            running = self.leader_for(unit).running_jobs(unit)
+        except LeaderAPIError as exc:
+            result = self._set_attribute(unit, job, attr, value)
+            return {**result, "note": f"Sent the change, but couldn't check whether {job} is running ({exc}). "
+                                      f"If it isn't running, nothing changed: start it instead."}
+        if job in running:
+            return self._set_attribute(unit, job, attr, value)
+        return {**self._run_job_rest(unit, job, start_options),
+                "note": f"{job} wasn't running, so it was started with {attr}={value}."}
+
     def _run_job(self, unit: str, job: str, options: dict[str, Any]) -> dict[str, Any]:
         transport = self.cfg.pioreactor.pump_transport
         if transport == "pios":
@@ -296,7 +315,9 @@ class PioreactorTools:
         unit = self.resolve_unit(unit)
         if check_only:  # validated; the agent asks for confirmation before the real call
             return {"ok": True}
-        result = self._set_attribute(unit, "temperature_automation", "target_temperature", round(celsius, 2))
+        target = round(celsius, 2)
+        result = self._change_or_start(unit, "temperature_automation", "target_temperature", target,
+                                       {"automation_name": "thermostat", "target_temperature": target})
         return {
             "ok": True,
             "unit": unit,
@@ -311,7 +332,7 @@ class PioreactorTools:
         unit = self.resolve_unit(unit)
         if check_only:  # validated; the agent asks for confirmation before the real call
             return {"ok": True}
-        result = self._set_attribute(unit, "stirring", "target_rpm", round(rpm))
+        result = self._change_or_start(unit, "stirring", "target_rpm", round(rpm), {"target_rpm": round(rpm)})
         return {"ok": True, "unit": unit, "target_rpm": round(rpm), **result}
 
     def start_job(

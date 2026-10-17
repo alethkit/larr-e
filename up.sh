@@ -15,15 +15,23 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SESSION="${LARRE_TMUX_SESSION:-larre}"
 SECRETS="${LARRE_SECRETS:-$HOME/.config/larr-e/secrets.env}"
 
+ATTACH=1
+if [[ "${1:-}" == "--no-attach" ]]; then ATTACH=0; shift; fi
+[[ "${2:-}" == "--no-attach" ]] && ATTACH=0
+
 case "${1:-real}" in
   real) ENV_FILE="$ROOT/real.env" ;;
   rehearsal) ENV_FILE="$ROOT/rehearsal.env" ;;
   *) ENV_FILE="$(realpath "$1")" ;;
 esac
-ATTACH=1
-[[ "${2:-}" == "--no-attach" || "${1:-}" == "--no-attach" ]] && ATTACH=0
 [[ -f "$ENV_FILE" ]] || { echo "Settings file not found: $ENV_FILE" >&2; exit 1; }
 command -v tmux >/dev/null || { echo "tmux is not installed (sudo dnf install tmux)" >&2; exit 1; }
+
+# Restarting from inside the session would kill this very shell halfway through.
+if [[ -n "${TMUX:-}" ]] && [[ "$(tmux display-message -p '#S' 2>/dev/null)" == "$SESSION" ]]; then
+  echo "You're inside the '$SESSION' tmux session. Detach first (Ctrl-b then d), then run this again." >&2
+  exit 1
+fi
 
 # Restart cleanly if it's already running.
 if tmux has-session -t "$SESSION" 2>/dev/null; then

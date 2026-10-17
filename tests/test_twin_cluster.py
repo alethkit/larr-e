@@ -171,3 +171,17 @@ def test_twin_rejects_like_pioreactor(cluster):
     api.upload_profile("dup.yaml", 'version: "1.0"\nexperiment_profile_name: x\n')
     with pytest.raises(LeaderAPIError, match="already exists"):
         api.upload_profile("dup.yaml", 'version: "1.0"\nexperiment_profile_name: x\n')
+
+
+def test_twin_job_result_uses_pioreactor_envelope(cluster):
+    """Pioreactor 26.11 reduces a job run/stop to {unit: {"ok", "unit", "value"}} (web/tasks.py, fanout_success).
+    Clients that check `ok` per unit (upstream's tools.py does) must see the same shape from the twin."""
+    tw, cfg, url = cluster
+    from leader_api import LeaderAPI
+
+    api = LeaderAPI(url)
+    api.stop_job("twin2", "od_reading", "demo")
+    result = api.run_job("twin2", "od_reading", "demo")
+    assert result["twin2"]["ok"] is True and result["twin2"]["unit"] == "twin2"
+    result = api.stop_job("twin2", "od_reading", "demo")
+    assert result["twin2"]["ok"] is True

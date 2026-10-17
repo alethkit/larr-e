@@ -158,6 +158,20 @@ class SlackConfig:
 
 
 @dataclass(frozen=True)
+class ApiConfig:
+    """Local HTTP API (api_server.py) used by the 3DS browser dashboard and the PocketJS bridge."""
+
+    # 0.0.0.0 so a 3DS on the same Wi-Fi can reach it. Use a trusted network: it is plain HTTP.
+    host: str = _env("LARRE_API_HOST", "0.0.0.0")
+    port: int = _env_int("LARRE_API_PORT", 8787)
+    # Shared secret required on every request (?k=... or X-Larre-Token). Generated at startup if unset.
+    token: str | None = _env("LARRE_API_TOKEN")
+    approval_timeout_s: float = _env_float("LARRE_API_APPROVAL_TIMEOUT_S", 180.0)
+    workers: int = _env_int("LARRE_API_WORKERS", 4)
+    max_jobs: int = _env_int("LARRE_API_MAX_JOBS", 100)
+
+
+@dataclass(frozen=True)
 class Settings:
     mqtt: MQTTConfig = field(default_factory=MQTTConfig)
     topics: TopicConfig = field(default_factory=TopicConfig)
@@ -167,6 +181,7 @@ class Settings:
     llm: LLMConfig = field(default_factory=LLMConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     slack: SlackConfig = field(default_factory=SlackConfig)
+    api: ApiConfig = field(default_factory=ApiConfig)
 
     def ensure_dirs(self) -> None:
         self.output.runtime_dir.mkdir(parents=True, exist_ok=True)

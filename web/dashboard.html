@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=320">
+<title>LARR-E</title>
+<style>
+/* Written for the Nintendo 3DS browser (old WebKit): ES5, no flexbox, 320px wide. */
+body { margin: 0; padding: 4px; width: 312px; background: #0b1f1d; color: #e6f4f1;
+       font-family: Arial, Helvetica, sans-serif; font-size: 13px; }
+h1 { font-size: 16px; margin: 0 0 4px 0; color: #5eead4; }
+h1 span { font-size: 11px; color: #94a3b8; font-weight: normal; }
+.box { background: #12302c; border: 1px solid #1f4d47; padding: 4px; margin-bottom: 4px; }
+.alert { background: #7f1d1d; border-color: #ef4444; }
+.warn { background: #713f12; border-color: #f59e0b; }
+.approval { background: #422006; border: 2px solid #fbbf24; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; color: #94a3b8; font-weight: normal; }
+td, th { padding: 1px 2px; }
+.bad { color: #fca5a5; font-weight: bold; }
+.bars { height: 40px; white-space: nowrap; }
+.bars div { display: inline-block; width: 6px; margin-right: 1px; background: #2dd4bf; vertical-align: bottom; }
+.btn { display: inline-block; width: 146px; margin: 2px; padding: 8px 0; text-align: center;
+       background: #115e59; color: #fff; border: 1px solid #2dd4bf; font-size: 13px; text-decoration: none; }
+.approval .btn { width: 136px; }
+.yes { background: #166534; border-color: #4ade80; }
+.no { background: #7f1d1d; border-color: #f87171; }
+.muted { color: #94a3b8; font-size: 11px; }
+#answer { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>LARR-E <span id="conn">connecting…</span></h1>
+<div id="alert" class="box alert" style="display:none"></div>
+<div id="approval" class="box approval" style="display:none"></div>
+<div class="box"><table id="status"><tr><td class="muted">waiting for telemetry…</td></tr></table></div>
+<div class="box"><div class="muted" id="sparkLabel">OD, last 30 min</div><div class="bars" id="spark"></div></div>
+<div id="presets"></div>
+<div class="box"><div class="muted">Answer</div><div id="answer">Tap a button above.</div></div>
+<script>
+var TOKEN = (location.search.match(/[?&]k=([^&]+)/) || [])[1] || "";
+TOKEN = decodeURIComponent(TOKEN);
+var currentJob = null, shownApproval = null, tick = 0;
+
+function $(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function fmt(entry, digits) {
+  return entry && typeof entry.value === "number" ? entry.value.toFixed(digits) : "–";
+}
+
+function req(method, path, body, cb) {
+  var x = new XMLHttpRequest();
+  var sep = path.indexOf("?") < 0 ? "?" : "&";
+  x.open(method, path + sep + "k=" + encodeURIComponent(TOKEN) + "&_=" + new Date().getTime(), true);
+  x.onreadystatechange = function () {
+    if (x.readyState !== 4) { return; }
+    var data = null;
+    try { data = JSON.parse(x.responseText); } catch (e) { data = null; }
+    $("conn").innerHTML = x.status ? "online" : "offline";
+    if (cb) { cb(x.status, data); }
+  };
+  if (body) {
+    x.setRequestHeader("Content-Type", "application/json");
+    x.send(JSON.stringify(body));
+  } else {
+    x.send(null);
+  }
+}
+
+function renderStatus(s) {
+  if (!s || !s.available) {
+    $("status").innerHTML = "<tr><td class='muted'>" + esc((s && s.note) || "no telemetry") + "</td></tr>";
+    return;
+  }
+  var html = "<tr><th>unit</th><th>OD</th><th>°C</th><th>µ h⁻¹</th><th>RPM</th></tr>";
+  for (var unit in s) {
+    if (unit === "available" || !s.hasOwnProperty(unit)) { continue; }
+    var u = s[unit], od = u.od ? (u.od.od1 || u.od.od2) : null;
+    var t = u.temperature ? u.temperature.value : null;
+    var tCls = t !== null && (t < 22 || t > 42) ? " class='bad'" : "";
+    var g = u.growth_rate ? u.growth_rate.value : null;
+    var gCls = g !== null && g < -0.1 ? " class='bad'" : "";
+    html += "<tr><td>" + esc(unit) + "</td><td>" + fmt(od, 3) + "</td><td" + tCls + ">" +
+      fmt(u.temperature, 1) + "</td><td" + gCls + ">" + fmt(u.growth_rate, 2) + "</td><td>" +
+      fmt(u.stirring, 0) + "</td></tr>";
+  }
+  $("status").innerHTML = html;
+}
+
+function renderAlerts(data) {
+  var alerts = (data && data.alerts) || [];
+  var last = alerts[alerts.length - 1];
+  if (!last) { $("alert").style.display = "none"; return; }
+  if (last.age_s === null || last.age_s > 600) { $("alert").style.display = "none"; return; }
+  $("alert").className = "box " + (last.severity === "critical" ? "alert" : "warn");
+  $("alert").innerHTML = "<b>" + esc(last.severity.toUpperCase()) + " · " + esc(last.unit) +
+    "</b><br>" + esc(last.message);
+  $("alert").style.display = "block";
+}
+
+function renderSpark(data) {
+  var v = (data && data.values) || [];
+  if (!v.length) { $("spark").innerHTML = "<span class='muted'>no data</span>"; return; }
+  var lo = Math.min.apply(null, v), hi = Math.max.apply(null, v), span = hi - lo || 1, html = "";
+  for (var i = 0; i < v.length; i++) {
+    html += "<div style='height:" + Math.round(3 + 37 * (v[i] - lo) / span) + "px'></div>";
+  }
+  $("spark").innerHTML = html;
+  $("sparkLabel").innerHTML = "OD " + esc(data.unit) + ", last 30 min: " + lo.toFixed(3) + " – " + hi.toFixed(3);
+}
+
+function renderApprovals(data) {
+  var list = (data && data.approvals) || [];
+  if (!list.length) { $("approval").style.display = "none"; shownApproval = null; return; }
+  var a = list[0];
+  if (shownApproval === a.id) { return; }
+  shownApproval = a.id;
+  var args = [];
+  for (var k in a.args) {
+    if (a.args.hasOwnProperty(k) && a.args[k] !== null) { args.push(esc(k) + "=" + esc(a.args[k])); }
+  }
+  $("approval").innerHTML = "<b>⚠ Hardware action</b><br>" + esc(a.tool) + "(" + args.join(", ") + ")<br>" +
+    "<a href='#' class='btn yes' onclick=\"return decide('" + a.id + "','approve')\">Approve</a>" +
+    "<a href='#' class='btn no' onclick=\"return decide('" + a.id + "','deny')\">Deny</a>";
+  $("approval").style.display = "block";
+}
+
+function decide(id, decision) {
+  $("approval").innerHTML = "Sending " + decision + "…";
+  req("POST", "/api/approvals/" + id, { decision: decision, by: "3ds-browser" }, function () {
+    shownApproval = null;
+    poll();
+  });
+  return false;
+}
+
+function runPreset(name) {
+  $("answer").innerHTML = "Thinking…";
+  req("POST", "/api/presets/" + name, { style: "web", source: "3ds-browser" }, function (status, data) {
+    if (status === 202 && data) { currentJob = data.job_id; } else {
+      $("answer").innerHTML = "Error: " + esc((data && data.error) || status);
+    }
+  });
+  return false;
+}
+
+function pollJob() {
+  if (!currentJob) { return; }
+  req("GET", "/api/jobs/" + currentJob, null, function (status, job) {
+    if (!job || status !== 200) { currentJob = null; return; }
+    if (job.state === "running") {
+      $("answer").innerHTML = job.approval ? "Waiting for approval…" : "Thinking…";
+      return;
+    }
+    $("answer").innerHTML = esc(job.answer);
+    currentJob = null;
+  });
+}
+
+function loadPresets() {
+  req("GET", "/api/presets", null, function (status, data) {
+    var p = (data && data.presets) || [], html = "";
+    for (var i = 0; i < p.length; i++) {
+      html += "<a href='#' class='btn' onclick=\"return runPreset('" + p[i].name + "')\">" + esc(p[i].label) + "</a>";
+    }
+    $("presets").innerHTML = html;
+  });
+}
+
+function poll() {
+  req("GET", "/api/approvals", null, function (s, d) { renderApprovals(d); });
+  pollJob();
+  if (tick % 2 === 0) { req("GET", "/api/status", null, function (s, d) { renderStatus(d); }); }
+  if (tick % 3 === 0) { req("GET", "/api/alerts?n=1", null, function (s, d) { renderAlerts(d); }); }
+  if (tick % 10 === 0) { req("GET", "/api/series?metric=od&minutes=30&points=40", null, function (s, d) { renderSpark(d); }); }
+  tick++;
+}
+
+loadPresets();
+poll();
+setInterval(poll, 1500);
+</script>
+</body>
+</html>

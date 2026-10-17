@@ -1,0 +1,15 @@
+{
+  "name": "larr-e-3ds",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "setup": "bun scripts/setup.ts",
+    "3ds": "bun scripts/build.ts",
+    "deploy": "python3 scripts/deploy.py",
+    "bridge": "bun bridge/serve.ts",
+    "test": "bun test ./test",
+    "check": "bun x tsc -p ."
+  }
+}

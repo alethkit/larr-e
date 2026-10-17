@@ -28,6 +28,9 @@ act on the hardware in plain English, with hard safety limits and a human confir
 | `listener.py` | MQTT anomaly monitor: OD spike/drop, temperature drop/out-of-band, growth crash, stirring stall |
 | `slack_bot.py` | Slack front end: mentions, DMs, `/larr-e`, threaded conversations, Approve/Deny buttons, alert posts with plots |
 | `slack_manifest.yaml` | Paste-in manifest that creates the Slack app with the right scopes and Socket Mode |
+| `api_server.py` | Local HTTP API (`larr-e api`): status, alerts, data, agent jobs and approvals, behind a token |
+| `web/dashboard.html` | Dashboard for small, old browsers, including the Nintendo 3DS browser. Served by the API |
+| `pocket3ds/` | Native Nintendo 3DS app (PocketJS) and the bridge that pairs it with the API. See [pocket3ds/README.md](pocket3ds/README.md) |
 | `inject_anomaly.py` | Demo helper that publishes Pioreactor-format fake telemetry to trigger alerts on cue |
 
 ---
@@ -88,6 +91,7 @@ export LARRE_EXPERIMENT=larre-demo        # optional; otherwise taken from live 
 export LARRE_DB_PATH=/home/pioreactor/.pioreactor/storage/pioreactor.sqlite
 # Slack: see section 4. (LARRE_SLACK_WEBHOOK_URL is a no-bot fallback; don't set it while the bot runs, or alerts post twice.)
 export LARRE_EFFORT=low                      # snappier answers on stage (default: medium)
+export LARRE_API_TOKEN=pick-a-long-random-string   # for `larr-e api`, the 3DS bridge and dashboard
 ```
 
 Run the agent **on the leader** to get direct DB access. To run it from a laptop, copy the DB over
@@ -120,6 +124,7 @@ larr-e chat                                         # multi-turn session
 larr-e alerts -n 5
 larr-e listen [--no-triage]
 larr-e slack                                        # Slack bot front end (section 4)
+larr-e api                                          # HTTP API + 3DS/phone dashboard (section 5)
 ```
 
 **Safety model**
@@ -189,7 +194,37 @@ channels the bot has been invited to.
 
 ---
 
-## 5. Live presentation script (5 minutes)
+## 5. Nintendo 3DS front ends
+
+There are two ways to use LARR-E from a 3DS. Both run on top of `larr-e api`:
+
+```bash
+export LARRE_API_TOKEN=pick-a-long-random-string
+larr-e api        # prints http://<this-computer's-LAN-IP>:8787/?k=<token>
+```
+
+On Fedora, open the port for your LAN: `sudo firewall-cmd --add-port=8787/tcp` (the rule lasts
+until reboot).
+
+**The browser dashboard needs no homebrew.** Open the printed URL in the 3DS's built-in browser,
+or on a phone. You get:
+- live status, the newest alert and an OD sparkline
+- four request buttons
+- an Approve/Deny card whenever an agent request wants to move hardware
+
+It uses ES5 JavaScript and a 320 px layout, so the old 3DS browser can run it.
+
+**The native app is the quirky one.** A PocketJS app shows the dashboard on the top screen and
+turns the touch screen into the approval gate: Ⓐ approves, Ⓑ denies. It builds on Linux, and has
+a simulator for testing without a 3DS. Setup, build, deploy and troubleshooting are in
+[pocket3ds/README.md](pocket3ds/README.md).
+
+Approvals from any front end are logged in `runtime/audit.jsonl`, tagged with their source (`api:3ds`,
+`api:3ds-browser`, `slack`).
+
+---
+
+## 6. Live presentation script (5 minutes)
 
 ### Stage layout
 - **Projector:** one terminal split into three panes (tmux), font size 18 or larger:
@@ -200,6 +235,8 @@ channels the bot has been invited to.
   the media and waste lines primed, and an empty beaker under the waste line. Angle the pump towards the judges.
 - **Second screen (or the right half of the projector):** Slack, showing `#bioreactor-alerts`.
   A teammate's laptop is logged in as a *second user*, so the two-person approval is real.
+- **In your pocket:** a 3DS running LARR-E, paired through `bun run bridge <3ds-ip>`. Optionally
+  put it under a document camera for the finale.
 
 ### T-30 min pre-flight checklist
 1. `ping pioreactor.local`, then `larr-e status`: the demo unit shows live OD, temperature and RPM.
@@ -211,7 +248,8 @@ channels the bot has been invited to.
 7. Start `larr-e slack` (in a hidden tmux window) and check that `/larr-e status` answers in
    `#bioreactor-alerts`. Set `LARRE_SLACK_ALLOW_SELF_APPROVAL=0` and put the teammate's user ID
    in `LARRE_SLACK_APPROVERS`.
-8. Type the demo commands into a scratch file so you can paste them; typos on stage cost seconds.
+8. Start `larr-e api` and the 3DS bridge. On the 3DS, the dot must be green and "Health check" must answer.
+9. Type the demo commands into a scratch file so you can paste them; typos on stage cost seconds.
 
 ### Minute-by-minute
 
@@ -262,7 +300,7 @@ python inject_anomaly.py --unit worker1 --scenario od_spike --live-baseline
 > "Every hardware action goes through a human gate, and every decision is in the audit log: who
 > asked, who approved, and exactly what was sent."
 
-**3:50–4:30 · Safety is code, not vibes**
+**3:50–4:15 · Safety is code, not vibes**
 ```bash
 larr-e exec "dump 50ml of media into worker1"
 ```
@@ -271,10 +309,18 @@ larr-e exec "dump 50ml of media into worker1"
 Optional, if time allows: `larr-e query "turn the heater off"` shows that query mode has no
 hardware tools at all.
 
-**4:30–5:00 · Close**
+**4:15–4:45 · One more thing** (pull out the 3DS)
+> "Lab alarms deserve better hardware. So here's LARR-E on a Nintendo 3DS."
+- The top screen shows the same live dashboard and the alert. Tap **Dilute 0.5 ml** (it's red
+  because it moves hardware).
+- The touch screen turns into **HARDWARE ACTION: run a pump**. Hold it up and press **Ⓐ**. The pump
+  spins.
+> "Same agent, same safety limits, same audit log. The approval button is just a lot more fun."
+
+**4:45–5:00 · Close**
 > "LARR-E turns a closed, single-screen alarm system into a shared, conversational operator: it
-> watches, explains and acts with your approval, on open hardware, in about 2,100 lines of
-> Python. Next: multi-reactor fleet views and auto-generated experiment logs. Thank you."
+> watches, explains and acts with your approval, on open hardware, from a terminal, Slack, or a
+> 3DS. Next: multi-reactor fleet views and auto-generated experiment logs. Thank you."
 
 ### If something breaks on stage
 | Symptom | Recovery |
@@ -286,10 +332,11 @@ hardware tools at all.
 | API error | Show `larr-e status`, `larr-e alerts` and the listener, none of which need the LLM |
 | Slack is silent | Check the `larr-e slack` window for `not_in_channel` (run `/invite @LARR-E`); otherwise carry on in the terminal |
 | Approval card never resolves | It expires after 180 s with nothing changed; rerun from the terminal with `larr-e exec` |
+| 3DS dot is red | Skip the beat, or open the browser dashboard on the 3DS instead (same buttons, same approval card) |
 
 ---
 
-## 6. Notes and limits
+## 7. Notes and limits
 - Injected readings on a real cluster are stored by the leader under the experiment you name. Use a
   dedicated demo experiment (`--experiment larre-demo`) if your data must stay clean.
 - `--live-baseline` waits for one real reading and spikes relative to it, so the injected values

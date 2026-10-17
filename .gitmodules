@@ -1,0 +1,4 @@
+[submodule "pocket3ds/runtime"]
+	path = pocket3ds/runtime
+	url = https://github.com/pocket-stack/pocketjs.git
+	ignore = untracked

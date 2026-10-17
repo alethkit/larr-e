@@ -3,7 +3,7 @@
     larr-e exec  "pump 1ml of media into worker1"
     larr-e query "plot the last 10 minutes of OD against temperature"
     larr-e chat
-    larr-e listen | status | alerts | slack
+    larr-e listen | status | alerts | slack | api
 """
 
 from __future__ import annotations
@@ -420,6 +420,16 @@ def listen_cmd(no_triage: bool) -> None:
     import listener
 
     listener.run(auto_triage=False if no_triage else None)
+
+
+@cli.command("api")
+@click.option("--host", help="Bind address (default from LARRE_API_HOST, 0.0.0.0).")
+@click.option("--port", type=int, help="Port (default from LARRE_API_PORT, 8787).")
+def api_cmd(host: str | None, port: int | None) -> None:
+    """Run the HTTP API and the 3DS browser dashboard."""
+    import api_server
+
+    api_server.run(host=host, port=port)
 
 
 @cli.command("slack")

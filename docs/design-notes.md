@@ -83,7 +83,8 @@ something that already exists, which is the point of the current design.
 ## 4. Earlier advice that was wrong or unchecked
 
 - **"The `run/<job>` MQTT path changed between releases."** Worse than that: current Pioreactor has
-  no subscriber for it at all. Use REST. See `CLAUDE.md` decision 3.
+  no subscriber for it at all. Confirmed on `pio01` (26.11.0), where a publish started nothing. LARR-E
+  now starts jobs over REST only. See `CLAUDE.md` decision 3.
 - **"Use the profile dry-run as a pre-flight check."** Pioreactor's dry-run executes in real time,
   so an 18-hour profile logs for 18 hours. The leader validates profiles on upload instead.
 - **"Stop the profile job to end an experiment."** That stops every profile in the experiment. Stop
@@ -91,9 +92,9 @@ something that already exists, which is the point of the current design.
 - **"Use Pioreactor's mocks as a simulator."** They don't respond to control. See decision 6.
 - **The MCP server's maturity and release timeline** as the thread stated them: not independently
   checked.
-- **Hardware:** the board looked Pi Zero 2 W-sized in a photo, not the Pi 3B first assumed. The
-  Pi Zero 2 W only does 2.4 GHz Wi-Fi, which matters for hotspots. Confirm with
-  `/unit_api/versions/app` or `cat /proc/device-tree/model` on the Pi.
+- **Hardware:** the board was guessed as a Pi 3B, then a Pi Zero 2 W from a photo. Both wrong:
+  `/proc/device-tree/model` says **Raspberry Pi 3 Model A+**, which has 5 GHz Wi-Fi, so the 2.4 GHz
+  hotspot worry doesn't apply.
 - **The first code review of LARR-E** was a review of untested code. Nothing counts as working until
   it has run against the Pi or the twin.
 

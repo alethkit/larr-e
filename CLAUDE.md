@@ -47,10 +47,13 @@ the same interfaces.
 2. **The plan is persisted** (`runtime/experiment_plans.json`, one per unit). It feeds the agent's
    context and alert triage (`expected_state`), so a job stopping at the planned end isn't a fault.
    It also drives Slack progress updates, which make no LLM call.
-3. **Start jobs over REST, not MQTT.** Current Pioreactor (checked against the 26.11 source) has no
-   subscriber for `pioreactor/<unit>/<exp>/run/<job>`, so the old default `mqtt` transport is
-   probably a silent no-op. `LARRE_PUMP_TRANSPORT=rest` uses the leader's API, the same calls the UI
-   and MCP server make. `.../set` and `$state/set` over MQTT are still fine.
+3. **Start jobs over REST, never MQTT.** Pioreactor 26.11 has no subscriber for
+   `pioreactor/<unit>/<exp>/run/<job>`: checked in the source installed on `pio01`, and on 17 Oct a
+   publish there started nothing while the old tool reported `ok`. `rest` (the leader's API, the same
+   calls the UI and MCP server make) is the default, `pios` works on the leader, and any other
+   `LARRE_PUMP_TRANSPORT` is refused. `.../set` and `$state/set` over MQTT work (also tested on
+   `pio01`). An event log doesn't need the command transport: jobs publish their `$state` on MQTT
+   however they were started.
 4. **Stop a plan by job id.** Stopping `job_name=experiment_profile` through the leader stops
    *every* profile in the experiment, including other units' plans. `stop_experiment` finds its own
    run by `profile_filename` and stops it by `job_id`.
@@ -79,6 +82,14 @@ the same interfaces.
 12. **Tooling:** `uv sync`, `uv run larr-e …`, `uv run --group dev pytest`. `requirements.txt`
     stays for plain pip on the Pi; keep it in step with `pyproject.toml`.
 
+## The real Pioreactor
+
+`pio01`: a Raspberry Pi 3 Model A+ running Pioreactor 26.11.0 (pioreactor_20ml), leader and worker
+in one, at `http://pioreactor.local` on the phone hotspot. SSH as `pioreactor` with a key; MQTT user
+`pioreactor` on port 1883. **Only the stirrer and heater are connected, no pump**: a dose would
+"succeed" and move nothing, so never use one as proof that control works. The Pi logs to
+`/var/log/pioreactor.log` in local time (UTC+1).
+
 ## Working rules
 
 Adapted from the organisers' prompting playbook. A summary is in `docs/design-notes.md`.
@@ -102,8 +113,9 @@ Adapted from the organisers' prompting playbook. A summary is in `docs/design-no
 
 ## Status (as of Saturday afternoon)
 
-Branch `experiment-plans` on `alethkit/larr-e`. All 21 tests pass offline; 1 is skipped unless the
-Pioreactor source is importable.
+Branch `experiment-plans` on `alethkit/larr-e`. 23 tests pass offline; 1 is skipped unless the
+Pioreactor source is importable. Run them with `uv run`: calling `.venv/bin/python -m pytest`
+directly leaves `amqtt` off PATH, and the end-to-end twin tests then skip silently.
 
 | Area | State |
 |---|---|
@@ -112,38 +124,45 @@ Pioreactor source is importable.
 | Digital twin (`larr-e twin`), faults, `/twin/state` | Built, tested end to end |
 | Listener recorder, `list_units`, `/larr-e units` | Built, tested |
 | 3DS: browser dashboard and native PocketJS app with an Ⓐ/Ⓑ approval gate | Built (by the team, before this branch). Shown in the PocketJS simulator; check it on the handheld |
-| Real Pi on the phone hotspot | Laptop reaches `pioreactor.local`. **Not yet confirmed:** software version, MQTT login, and a real 5-minute plan starting and stopping on schedule |
+| Real Pi on the phone hotspot | Confirmed 17 Oct: Pioreactor 26.11.0, one unit `pio01` (leader and worker) assigned to "Demo experiment", clock synced, MQTT login, `listen` + `status`, REST job start, MQTT setting change and stop. **Not yet:** a real 5-minute plan starting and stopping on schedule |
 | `.env`, uv, LICENSE | Done (LICENSE only on `alethkit` main) |
 
 ## Open items, in priority order
 
-1. **Real-Pi check.** Read-only first (version, workers, assignment, clock, MQTT login,
-   `larr-e listen` + `status`). Then, with a human watching: `larr-e exec "run <unit> at 30 degrees
-   and 300 rpm for 5 minutes"`. Profile visible in the UI → jobs start → they stop at 5 minutes. If
-   the version is older than about 26.7, compare `leader_api.py` and `experiment.py` against that
-   release first.
+1. **Real 5-minute plan on `pio01`**, with a human watching: `larr-e exec "run pio01 at 30 degrees
+   and 300 rpm for 5 minutes"`. Profile visible in the UI → jobs start → they stop at 5 minutes. The
+   read-only checks are done (see Status). Use stirring and the heater only: `pio01` has no pump.
 2. **Decide the submission repo** and merge `experiment-plans`. Check: fresh clone, `uv sync`,
    tests pass, no secrets, LICENSE present.
-3. **Once the version is known, make `rest` the default transport** if the MQTT run topic is
-   confirmed dead.
-4. **Triage before notifying.** `listener.py` posts an alert to Slack *before* Claude investigates.
+3. **Triage before notifying.** `listener.py` posts an alert to Slack *before* Claude investigates.
    For the attention-saving claim it should investigate first, then interrupt only if needed.
-   Critical safety alarms still go straight through.
-5. **The pitch** (3 min):
+   Critical safety alarms still go straight through. It should also know about stops: today a
+   stirring stop done in the Pioreactor UI raises a critical "stirring stall" alert.
+4. **The pitch** (3 min):
    - The problem: the legacy GUI plus babysitting. Set up the same run by clicking, timed, against
      one Slack message.
    - The real reactor responding, plus an automatic update with a graph.
+   - A real catch: on 17 Oct LARR-E's stall rule flagged `pio01`'s stirrer dropping to 0 RPM, which
+     the Pi's own log confirms happened four times in 15 minutes.
    - The twin cluster as the scale story.
    - Prepare answers for "isn't this just Pioreactor's MCP server?" and "what happens if the laptop
      dies?" (the profile keeps running).
-6. **README:** a person should rewrite it short; it is long and model-written. Keep the commands.
-7. **Known rough edges:**
+5. **README:** a person should rewrite it short; it is long and model-written. Keep the commands.
+6. **Known rough edges:**
    - `api_server.py` has its own approval flow, separate from Slack's.
    - The OD-spike rule doesn't account for growth (fine at real speed, trips at a fast twin
      bio-speed).
    - The Pi's `mqtt_to_db_streaming` may store twin readings, so give the twin its own experiment
      name.
    - `requirements.txt` and `uv.lock` can drift apart.
+   - **`pio01`'s stirrer stalls.** On 17 Oct the Pi logged "Stirring RPM is 0" and kicked the fan at
+     13:36, 13:40, 13:44 and 13:50 UTC. After a restart at 500 RPM it ran 6 minutes clean (467–534
+     RPM). Watch it before the demo; check the stir bar and vial seating if it recurs.
+   - **The listener doesn't backfill.** When the laptop dropped off the hotspot it reconnected by
+     itself but missed the readings in between, including one stall.
+   - **`pioreactor.local` (mDNS) lookups are flaky**, and inside Claude Code's sandbox ssh and MQTT
+     can't resolve it at all (curl works through the proxy). Expect a few seconds' delay on connect.
+   - The `./.env.*` read deny also hides `.env.example` from Claude Code.
 
 ## Running it
 

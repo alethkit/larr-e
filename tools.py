@@ -725,7 +725,7 @@ class PioreactorTools:
     # Colours for plan charts: dark, high-contrast, readable on a projector and in Slack's dark mode.
     PLAN_STYLE = {"bg": "#0b1220", "panel": "#111a2e", "grid": "#22304d", "text": "#e6edf7", "muted": "#8a9bb8",
                   "target": "#2dd4bf", "measured": {"temperature": "#f59e0b", "stirring": "#60a5fa"},
-                  "off": "#ef4444"}
+                  "off": "#ef4444", "proposed": "#e879f9"}
 
     def _plan_series(self, plan: ExperimentPlan) -> tuple[float, dict[str, tuple[list[float], list[float]]]]:
         """Plan start (epoch s) and, per setpoint metric, (minutes since start, values)."""
@@ -742,8 +742,9 @@ class PioreactorTools:
         return start, out
 
     def _draw_plan(self, fig: Any, plan: ExperimentPlan, series: dict[str, tuple[list[float], list[float]]],
-                   upto_min: float) -> dict[str, float]:
-        """Draw the plan chart with readings up to `upto_min`. Returns minutes off target per metric."""
+                   upto_min: float, proposed: dict[str, float] | None = None) -> dict[str, float]:
+        """Draw the plan chart with readings up to `upto_min`. Returns minutes off target per metric.
+        `proposed` (metric -> value) adds a second dashed line from now to the end: a change not yet applied."""
         from matplotlib.patches import Rectangle
 
         st = self.PLAN_STYLE
@@ -776,15 +777,23 @@ class PioreactorTools:
                     off += nxt - t
                     run_start = t if run_start is None else run_start
                 if run_start is not None and (not bad or i + 1 == len(pts)):
-                    ax.annotate(f"off target\n{(nxt if bad else t) - run_start:.1f} min", xy=(run_start, target),
+                    ax.annotate(f"off target\n{(nxt if bad else t) - run_start:.1f} min",
+                                xy=(run_start, plan.target(metric, run_start * 60)),
                                 xytext=(4, -26), textcoords="offset points", color=st["off"], fontsize=8, weight="bold")
                     run_start = None
             off_target_min[metric] = round(off, 1)
-            # target: a glowing dashed line across the whole plan
+            # target: a glowing dashed line across the whole plan, stepping at each approved change
+            steps = plan.target_steps(metric)
+            sx, sy = [t for t, _ in steps] + [end_min], [v for _, v in steps] + [steps[-1][1]]
             for lw, alpha in ((9, 0.06), (5, 0.12)):
-                ax.hlines(target, 0, end_min, colors=st["target"], lw=lw, alpha=alpha)
-            ax.hlines(target, 0, end_min, colors=st["target"], linestyles=(0, (6, 4)), lw=2)
+                ax.plot(sx, sy, color=st["target"], lw=lw, alpha=alpha, drawstyle="steps-post")
+            ax.plot(sx, sy, color=st["target"], ls=(0, (6, 4)), lw=2, drawstyle="steps-post", gid="target")
             ax.text(end_min, target, f" target {target:g}", color=st["target"], fontsize=8, va="bottom", ha="right")
+            if proposed and proposed.get(metric) is not None:
+                new, now_min = proposed[metric], min(max(upto_min, 0.0), end_min)
+                ax.plot([now_min, end_min], [new, new], color=st["proposed"], ls="--", lw=2.2, gid="proposed")
+                ax.text(end_min, new, f" proposed {new:g}", color=st["proposed"], fontsize=8, weight="bold",
+                        va="bottom" if new >= target else "top", ha="right")
             if vs:
                 lo = min(min(vs), target)
                 ax.fill_between(ts, vs, lo - abs(lo) * 0.05, color=color, alpha=0.18, lw=0)
@@ -812,15 +821,16 @@ class PioreactorTools:
         ])
         return off_target_min
 
-    def plot_plan(self, plan: ExperimentPlan) -> dict[str, Any]:
+    def plot_plan(self, plan: ExperimentPlan, proposed: dict[str, float] | None = None) -> dict[str, Any]:
         """PNG of the plan against what happened: one panel per setpoint (temperature, stirring) with
-        the target as a dashed line and off-target stretches shaded. The /plan page draws the same."""
+        the target as a dashed line and off-target stretches shaded. The /plan page draws the same.
+        `proposed` draws a setpoint change that is waiting for approval as a second dashed line."""
         from matplotlib.figure import Figure
 
         start, series = self._plan_series(plan)
         fig = Figure(figsize=(10, 2.3 * len(series) + 1.4), dpi=120)
-        off_target_min = self._draw_plan(fig, plan, series, (time.time() - start) / 60)
-        out = self.cfg.output.plots_dir / f"{plan.unit}_plan_{int(time.time())}.png"
+        off_target_min = self._draw_plan(fig, plan, series, (time.time() - start) / 60, proposed)
+        out = self.cfg.output.plots_dir / f"{plan.unit}_plan_{time.time_ns()}.png"
         out.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out, facecolor=fig.get_facecolor())
         return {"unit": plan.unit, "png_path": str(out), "off_target_min": off_target_min}

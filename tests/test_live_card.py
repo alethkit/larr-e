@@ -72,3 +72,58 @@ def test_setpoint_history_survives_the_store(tmp_path):
     store.put(plan)
     again = store.get("pio1")
     assert again.target("stirring") == 350 and again.setpoints == plan.setpoints
+
+
+# ------------------------------------------------------------------ piece 2: the chart draws steps and a proposal
+
+
+def drawn(tmp_path, plan, proposed=None):
+    """Draw the plan chart and return {metric: {gid: line}} for the lines tagged 'target' and 'proposed'."""
+    from matplotlib.figure import Figure
+
+    from tools import PioreactorTools
+
+    tools = PioreactorTools(make_settings(tmp_path), render_terminal=False)
+    start, series = tools._plan_series(plan)
+    fig = Figure(figsize=(10, 6))
+    tools._draw_plan(fig, plan, series, (time.time() - start) / 60, proposed=proposed)
+    out = {}
+    for ax, metric in zip(fig.axes, series):
+        out[metric] = {line.get_gid(): line for line in ax.get_lines() if line.get_gid()}
+    return out
+
+
+def test_target_line_steps_at_each_approved_change(tmp_path):
+    start = time.time() - 20 * MIN
+    write_history(tmp_path, start)
+    plan = running_plan(start)
+    plan.set_target("stirring", 350, now=datetime.fromtimestamp(start + 15 * MIN, timezone.utc))
+    lines = drawn(tmp_path, plan)
+    stir = lines["stirring"]["target"]
+    assert list(stir.get_ydata())[0] == 300 and list(stir.get_ydata())[-1] == 350
+    assert stir.get_drawstyle() == "steps-post"
+    assert "proposed" not in lines["stirring"]
+
+
+def test_a_proposal_is_a_second_dashed_line_from_now_to_the_end(tmp_path):
+    start = time.time() - 20 * MIN
+    write_history(tmp_path, start)
+    plan = running_plan(start)
+    lines = drawn(tmp_path, plan, proposed={"temperature": 31})
+    prop = lines["temperature"]["proposed"]
+    assert set(prop.get_ydata()) == {31}
+    xs = list(prop.get_xdata())
+    assert 19 <= xs[0] <= 21 and xs[-1] == plan.duration_h * 60  # from now to the planned end
+    assert prop.get_linestyle() == "--"
+    assert prop.get_color() != lines["temperature"]["target"].get_color()
+    assert "proposed" not in lines["stirring"]
+
+
+def test_plot_plan_passes_the_proposal_through(tmp_path):
+    from tools import PioreactorTools
+
+    start = time.time() - 20 * MIN
+    write_history(tmp_path, start)
+    tools = PioreactorTools(make_settings(tmp_path), render_terminal=False)
+    out = tools.plot_plan(running_plan(start), proposed={"stirring": 350})
+    assert Path(out["png_path"]).stat().st_size > 1000

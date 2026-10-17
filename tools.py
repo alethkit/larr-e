@@ -14,6 +14,7 @@ live state snapshot that listener.py keeps up to date.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -52,6 +53,19 @@ METRIC_TABLES: dict[str, tuple[str, str, str]] = {
     "temperature": ("temperature_readings", "temperature_c", ""),
     "growth_rate": ("growth_rates", "rate", ""),
     "stirring": ("stirring_rates", "measured_rpm", ""),
+}
+
+UNIT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
+
+# audit_log kinds: which logged tool calls count as which kind of hardware action.
+AUDIT_KINDS: dict[str, Any] = {
+    "all": lambda tool, args: True,
+    "pump": lambda tool, args: tool == "dose",
+    "stirring": lambda tool, args: tool == "set_stirring_rpm"
+    or (tool in ("start_job", "stop_job") and args.get("job") == "stirring"),
+    "temperature": lambda tool, args: tool == "set_target_temperature"
+    or (tool in ("start_job", "stop_job") and args.get("job") == "temperature_automation"),
+    "experiment": lambda tool, args: tool in ("start_experiment", "stop_experiment"),
 }
 
 # The leader's live time-series API (/api/experiments/<exp>/time_series/<source>) covers these
@@ -118,6 +132,11 @@ class PioreactorTools:
     def resolve_unit(self, unit: str | None) -> str:
         unit = unit or self.cfg.pioreactor.default_unit
         if unit:
+            # Unit names are Pi hostnames. Checked here, before any approval card: the audit log once
+            # showed an approved pump run for "p i o 01", a model mangling "pio01".
+            if not UNIT_NAME.fullmatch(unit):
+                raise ToolError(f"'{unit}' isn't a valid unit name (letters, digits, - and _ only). "
+                                f"Did you mean '{re.sub(r'[^A-Za-z0-9_-]', '', unit)}'?")
             return unit
         units = sorted(self._live_state().keys())
         if len(units) == 1:
@@ -887,6 +906,35 @@ class PioreactorTools:
                 raise ToolError(f"No live telemetry for {unit}. Known units: {sorted(state)}")
             return {"available": True, unit: state[unit]}
         return {"available": True, **state}
+
+    def audit_log(self, hours: float = 1, kind: str = "all", limit: int = 50) -> dict[str, Any]:
+        """Hardware actions from LARR-E's own audit log, newest last.
+
+        Front ends (Slack, API, CLI) log each decision: who asked, who approved. The agent logs each
+        action's result. So this answers "what did LARR-E do" without the Pi's database.
+        """
+        if kind not in AUDIT_KINDS:
+            raise ToolError(f"kind must be one of {sorted(AUDIT_KINDS)}")
+        if not 0 < hours <= 24 * 30:
+            raise ToolError("hours must be between 0 and 720")
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        path = self.cfg.output.audit_path
+        entries: list[dict[str, Any]] = []
+        for line in (path.read_text().splitlines() if path.exists() else []):
+            try:
+                record = json.loads(line)
+                when = parse_timestamp(record["at"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if when >= cutoff and AUDIT_KINDS[kind](record.get("tool", ""), record.get("args") or {}):
+                entries.append(record)
+        entries = entries[-limit:]
+        return {
+            "hours": hours, "kind": kind, "count": len(entries), "entries": entries,
+            "note": "Entries with 'decision' are approvals from Slack, the API or the terminal; entries "
+                    "with 'result' are what happened when LARR-E carried an action out. Pumps here are "
+                    "uncalibrated: durations are recorded, not volumes.",
+        }
 
     def list_recent_alerts(self, limit: int = 10) -> dict[str, Any]:
         path = self.cfg.output.alerts_path

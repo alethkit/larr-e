@@ -806,6 +806,30 @@ class PioreactorTools:
         fig.savefig(out, facecolor=fig.get_facecolor())
         return {"unit": plan.unit, "png_path": str(out), "off_target_min": off_target_min}
 
+    def replay_plan_gif(self, plan: ExperimentPlan, frames: int = 36, seconds: float = 5.0) -> dict[str, Any]:
+        """Animated GIF of the whole run: the measured lines draw themselves along the target line,
+        then the last frame holds. For the end-of-experiment message."""
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        from PIL import Image
+
+        start, series = self._plan_series(plan)
+        upto_end = min((time.time() - start) / 60, plan.duration_h * 60)
+        fig = Figure(figsize=(10, 2.3 * len(series) + 1.4), dpi=80)
+        canvas = FigureCanvasAgg(fig)
+        images, off_target_min = [], {}
+        for i in range(frames):
+            off_target_min = self._draw_plan(fig, plan, series, upto_end * (i + 1) / frames)
+            canvas.draw()
+            images.append(Image.frombuffer("RGBA", canvas.get_width_height(), canvas.buffer_rgba()).convert(
+                "P", palette=Image.Palette.ADAPTIVE, colors=128))
+        out = self.cfg.output.plots_dir / f"{plan.unit}_replay_{int(time.time())}.gif"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        step_ms = int(seconds * 1000 / frames)
+        images[0].save(out, save_all=True, append_images=images[1:], loop=0,
+                       duration=[step_ms] * (frames - 1) + [3000], optimize=True)
+        return {"unit": plan.unit, "gif_path": str(out), "off_target_min": off_target_min}
+
     # ------------------------------------------------------------------ live state
 
     def _live_state(self) -> dict[str, Any]:

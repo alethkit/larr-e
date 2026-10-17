@@ -94,6 +94,11 @@ alias larr-e="python $(pwd)/agent.py"
 ```
 
 ### Configure (env vars; full list in `config.py`)
+Put settings, and above all secrets, in a `.env` file: `cp .env.example .env`, then fill it in.
+It's gitignored, and LARR-E loads it at startup. Anything already set in the environment wins.
+`.claude/settings.json` stops Claude Code from reading `.env`, so keys don't end up in a model's
+context; you edit the file yourself. Use a dedicated Anthropic key for LARR-E with a spend limit,
+and revoke it after the event. The same variables can also be exported in the shell:
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 export LARRE_MQTT_HOST=pioreactor.local      # the leader's hostname or IP

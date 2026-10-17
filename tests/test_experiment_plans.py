@@ -322,3 +322,30 @@ def test_agent_exposes_and_gates_experiment_tools(tmp_path, monkeypatch):
 
     q = LarreAgent("query", cfg=make_settings(tmp_path), verbose=False)
     assert "start_experiment" not in {t["name"] for t in q.tool_specs}
+
+
+# ------------------------------------------------------------------ .env loading
+
+
+def test_env_file_loader(tmp_path, monkeypatch):
+    from config import _load_env_file
+
+    f = tmp_path / ".env"
+    f.write_text(
+        "# comment\n\nLARRE_T_A=plain\nexport LARRE_T_B='quoted # not a comment'\n"
+        'LARRE_T_C="x=y"\nLARRE_T_D=value # trailing\nLARRE_T_SET=from-file\nnot a line\n'
+    )
+    monkeypatch.setenv("LARRE_T_SET", "from-env")
+    for k in "ABCD":
+        monkeypatch.delenv(f"LARRE_T_{k}", raising=False)
+    _load_env_file(f)
+    import os
+
+    assert os.environ["LARRE_T_A"] == "plain"
+    assert os.environ["LARRE_T_B"] == "quoted # not a comment"
+    assert os.environ["LARRE_T_C"] == "x=y"
+    assert os.environ["LARRE_T_D"] == "value"
+    assert os.environ["LARRE_T_SET"] == "from-env"  # the environment wins
+    _load_env_file(tmp_path / "missing.env")  # no file: no error
+    for k in "ABCD":
+        monkeypatch.delenv(f"LARRE_T_{k}", raising=False)

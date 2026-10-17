@@ -12,6 +12,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _load_env_file(path: Path) -> None:
+    """Load KEY=VALUE lines from a .env file into os.environ, never overriding variables already set.
+
+    Secrets (Anthropic, Slack, MQTT) live in this gitignored file so they never need to be in the
+    shell, a settings UI, or a prompt. Supports comments, blank lines, `export KEY=...` and quotes.
+    """
+    try:
+        lines = path.read_text().splitlines()
+    except (FileNotFoundError, PermissionError):
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()  # trailing comment on an unquoted value
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file(Path(os.environ.get("LARRE_ENV_FILE", Path(__file__).resolve().parent / ".env")))
+
+
 def _env(name: str, default: str | None = None) -> str | None:
     value = os.environ.get(name)
     return value if value not in (None, "") else default

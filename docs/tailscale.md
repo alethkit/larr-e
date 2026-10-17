@@ -149,7 +149,7 @@ Then do part C and run `uv run larr-e status`: telemetry should arrive as it did
   and the laptop `lilith` holds a trusted key). If the Pi logs out and back in, its node key changes
   and it needs signing again.
 - Checked from the laptop over Tailscale, all read-only: ping is direct over the hotspot (about 20 ms,
-  no relay), REST returns 200, MQTT 1883 accepts the login, `larr-e status` shows `pio01`, and SSH works.
+  no relay), REST returns 200, `larr-e status` connects to MQTT 1883 and shows `pio01`, and SSH works.
 - SSH by IP needs the Pi's key and `IdentitiesOnly`, or the agent offers too many keys and the Pi
   hangs up. Add to `~/.ssh/config`:
   ```
@@ -193,7 +193,9 @@ LARRE_MQTT_HOST=pio01.tail16b47e.ts.net          # was pioreactor.local (or use 
 LARRE_LEADER_URL=http://pio01.tail16b47e.ts.net  # was http://pioreactor.local
 ```
 
-The MQTT username and password stay the same: it's the same broker, reached by a different route.
+There was no `.env` on the laptop at the time, and `larr-e status` still connected: the Pi's broker
+accepted a connection with no username. If you do set a broker login, keep it the same: it's the same
+broker, reached by a different route. Only tailnet devices and the hotspot can reach it.
 
 To run the real Pi and the twins together (decision 7 in `CLAUDE.md`), the twins still have to
 publish to the Pi's broker, because the listener follows one broker. Run the twin on the server

@@ -417,6 +417,12 @@ $("unit").addEventListener("change", async () => { await refreshPlan(); await re
 window.addEventListener("resize", render);
 
 (async function init() {
+  if (location.protocol === "file:") {  // opened from disk: there is no API to talk to
+    $("error").textContent = "Open this page from the LARR-E API (larr-e api, then http://<host>:<port>/plan?k=<token>), not as a file.";
+    $("start").disabled = true;
+    render();
+    return;
+  }
   await loadUnits();
   await refreshPlan();
   if (state.running) {  // start the draft from what is running, so a drag is a change to it

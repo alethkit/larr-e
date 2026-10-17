@@ -121,6 +121,7 @@ directly leaves `amqtt` off PATH, and the end-to-end twin tests then skip silent
 |---|---|
 | Experiment plans → profiles, approval card with profile YAML, Slack progress updates | Built, tested offline and against the twin |
 | REST transport, stop by job id, experiment from leader | Built, tested against the twin and a fake leader |
+| `/plan` page (`web/plan.html`): drag the plan's numbers, live profile YAML, dashed target line vs measured, Start through the approval gate, no LLM | Built 17 Oct, tested offline and in a browser against the twin. Not yet tried on `pio01` |
 | Digital twin (`larr-e twin`), faults, `/twin/state` | Built, tested end to end |
 | Listener recorder, `list_units`, `/larr-e units` | Built, tested |
 | 3DS: browser dashboard and native PocketJS app with an Ⓐ/Ⓑ approval gate | Built (by the team, before this branch). Shown in the PocketJS simulator; check it on the handheld |

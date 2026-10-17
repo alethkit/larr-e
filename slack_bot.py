@@ -135,6 +135,7 @@ class LarreBot:
         self.approvals: dict[str, PendingApproval] = {}
         self.alerts: dict[str, dict[str, Any]] = {}
         self.alert_threads: dict[str, tuple[str, str]] = {}
+        self.plan_lock = threading.RLock()  # read-modify-write of saved plans (progress loop vs. button clicks)
         self.file_ready_delay_s = 2.0  # Slack may need a moment before an upload can appear in a message
         self._register_handlers()
 
@@ -217,8 +218,9 @@ class LarreBot:
             # Progress updates for this plan go to the thread that started it.
             plan = self.tools.plans.get(result["plan"]["unit"])
             if plan:
-                plan.slack_channel, plan.slack_thread_ts = conv.channel, conv.thread_ts
-                self.tools.plans.put(plan)
+                self._save_plan(plan, slack_channel=conv.channel, slack_thread_ts=conv.thread_ts)
+                # The live card goes up straight away, so the plan can be adjusted from Slack from t = 0.
+                self.submit(self.post_plan_card, conv.channel, conv.thread_ts, plan, self.progress_text(plan))
 
     def upload_plot(self, channel: str, thread_ts: str | None, result: dict[str, Any], note: str = "") -> None:
         caption = f"`{result['unit']}`{note}"
@@ -430,6 +432,18 @@ class LarreBot:
 
     # ------------------------------------------------------------ experiment progress
 
+    def _save_plan(self, plan: Any, **fields: Any) -> None:
+        """Set fields on `plan` and on the saved copy, re-read under a lock so that a change saved meanwhile
+        (e.g. an approved setpoint) isn't overwritten by a stale copy. A newer plan for the unit is left alone."""
+        for k, v in fields.items():
+            setattr(plan, k, v)
+        with self.plan_lock:
+            saved = self.tools.plans.get(plan.unit)
+            if saved and (saved.name, saved.started_at) == (plan.name, plan.started_at):
+                for k, v in fields.items():
+                    setattr(saved, k, v)
+                self.tools.plans.put(saved)
+
     def _update_target(self, plan: Any) -> tuple[str, str | None] | None:
         if plan.slack_channel:
             return plan.slack_channel, plan.slack_thread_ts
@@ -446,10 +460,10 @@ class LarreBot:
         s = live.get(plan.unit, {})
         bits = []
         if "temperature" in s:
-            tgt = f" (target {plan.temperature_c:g})" if plan.temperature_c is not None else ""
+            tgt = f" (target {plan.target('temperature'):g})" if plan.temperature_c is not None else ""
             bits.append(f"temp {s['temperature']['value']:.1f} °C{tgt}")
         if "stirring" in s:
-            tgt = f" (target {plan.rpm:g})" if plan.rpm is not None else ""
+            tgt = f" (target {plan.target('stirring'):g})" if plan.rpm is not None else ""
             bits.append(f"stirring {s['stirring']['value']:.0f} rpm{tgt}")
         if s.get("od"):
             bits.append("OD " + ", ".join(f"{v['value']:.3f}" for _, v in sorted(s["od"].items())))
@@ -466,48 +480,76 @@ class LarreBot:
         return {"type": "button", "action_id": "larre_adjust", "url": f"{base.rstrip('/')}/plan?{query}",
                 "text": {"type": "plain_text", "text": "Adjust in LARR-E"}}
 
-    def plan_chart(self, plan: Any, final: bool = False) -> tuple[str, str] | None:
+    def plan_chart(self, plan: Any, final: bool = False, proposed: dict[str, float] | None = None) -> tuple[str, str] | None:
         """Draw the plan chart (a replay GIF for the final message). Returns (path, caption) or None."""
         try:
-            result = self.tools.replay_plan_gif(plan) if final else self.tools.plot_plan(plan)
+            result = self.tools.replay_plan_gif(plan) if final else self.tools.plot_plan(plan, proposed)
         except ToolError:
             return None  # the plan sets no temperature or stirring speed
         off = [f"{m} off target {v:g} min" for m, v in result["off_target_min"].items() if v]
         return result.get("gif_path") or result["png_path"], "plan vs measured: " + (", ".join(off) or "on target throughout")
 
-    def post_plan_card(self, channel: str, thread_ts: str | None, plan: Any, text: str, final: bool = False) -> None:
-        """One message: the update text, the plan chart inside it, and the Adjust button under the chart.
-        The chart is uploaded privately and shown through an image block. If Slack refuses that (e.g. the
-        upload is still processing), retry once, then post the text and share the chart in the thread."""
-        chart = self.plan_chart(plan, final)
+    def card_actions(self, plan: Any, final: bool = False) -> list[dict[str, Any]]:
+        """The buttons under the chart."""
         button = None if final else self.adjust_button(plan.unit)
-        actions = [{"type": "actions", "elements": [button]}] if button else []
+        return [{"type": "actions", "elements": [button]}] if button else []
+
+    def _send_card(self, channel: str, thread_ts: str | None, plan: Any, text: str,
+                   blocks: list[dict[str, Any]], final: bool) -> None:
+        """Edit the plan's live card in place, or post it (and remember it) if there is none yet or it was
+        deleted. The final message is always a new post, so that it notifies."""
+        if not final and plan.slack_card_ts:
+            try:
+                self.client.chat_update(channel=channel, ts=plan.slack_card_ts, text=text, blocks=blocks)
+                return
+            except SlackApiError as exc:
+                if exc.response.get("error") not in ("message_not_found", "cant_update_message", "edit_window_closed"):
+                    raise
+                log.info("Live card for %s is gone (%s); posting a new one", plan.unit, exc.response.get("error"))
+        ts = self.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text, blocks=blocks)["ts"]
+        if not final:
+            self._save_plan(plan, slack_card_ts=ts)
+
+    def post_plan_card(self, channel: str, thread_ts: str | None, plan: Any, text: str, final: bool = False,
+                       note: str = "") -> None:
+        """The plan's live card: the update text, the plan chart inside it, and buttons under the chart.
+        Progress updates and button clicks edit this one message in place. The chart is uploaded privately
+        and shown through an image block, under a new block_id each time (Slack can keep showing the old
+        image under a reused one). If Slack refuses the image (e.g. the upload is still processing), retry
+        once, then show the text and share the chart in the thread."""
+        proposed = None if final else self.proposed_values(plan.unit)
+        chart = self.plan_chart(plan, final, proposed)
+        actions = self.card_actions(plan, final)
         if chart:
             text = f"{text}\n_{chart[1]}_"
+        if note:
+            text = f"{text}\n{note}"
         section = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}]
         if chart:
             title = f"LARR-E plan vs measured · {plan.unit}"
             try:
                 file_id = self.client.files_upload_v2(file=chart[0], title=title)["file"]["id"]
-                image = {"type": "image", "slack_file": {"id": file_id}, "alt_text": f"{plan.name}: {chart[1]}"}
+                image = {"type": "image", "block_id": f"chart-{file_id}", "slack_file": {"id": file_id},
+                         "alt_text": f"{plan.name}: {chart[1]}"}
                 for attempt in range(2):
                     try:
-                        self.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text,
-                                                     blocks=section + [image] + actions)
+                        self._send_card(channel, thread_ts, plan, text, section + [image] + actions, final)
                         return
                     except SlackApiError:
                         if attempt == 0:
                             time.sleep(self.file_ready_delay_s)
             except (SlackApiError, KeyError, TypeError) as exc:
                 log.warning("Plan card with inline chart failed (%s); sharing the chart in the thread", exc)
-        self.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text,
-                                     blocks=(section + actions) if actions else None)
+        self._send_card(channel, thread_ts, plan, text, section + actions, final)
         if chart:
             try:
                 self.client.files_upload_v2(channel=channel, thread_ts=thread_ts, file=chart[0],
                                             title=f"LARR-E plan vs measured · {plan.unit}")
             except SlackApiError as exc:
                 log.warning("Plan chart upload failed: %s", exc.response.get("error"))
+
+    def proposed_values(self, unit: str) -> dict[str, float] | None:
+        return None
 
     def post_progress(self, plan: Any, final: bool = False) -> None:
         target = self._update_target(plan)
@@ -530,12 +572,10 @@ class LarreBot:
         for plan in self.tools.plans.all():
             if plan.status == "finished" and not plan.final_posted:
                 self.post_progress(plan, final=True)
-                plan.final_posted = True
-                self.tools.plans.put(plan)
+                self._save_plan(plan, final_posted=True)
             elif plan.update_due():
                 self.post_progress(plan)
-                plan.last_update_at = utc_timestamp()
-                self.tools.plans.put(plan)
+                self._save_plan(plan, last_update_at=utc_timestamp())
 
     def start_progress_loop(self) -> None:
         def loop() -> None:

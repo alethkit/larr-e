@@ -127,3 +127,106 @@ def test_plot_plan_passes_the_proposal_through(tmp_path):
     tools = PioreactorTools(make_settings(tmp_path), render_terminal=False)
     out = tools.plot_plan(running_plan(start), proposed={"stirring": 350})
     assert Path(out["png_path"]).stat().st_size > 1000
+
+
+# ------------------------------------------------------------------ piece 3: one live card, edited in place
+
+from test_slack_plan import CardSlack, bot_with  # noqa: E402
+
+
+class LiveSlack(CardSlack):
+    """CardSlack plus chat_update and ephemeral messages; `lost_ts` makes updates to those messages fail."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.updates, self.ephemeral, self.lost_ts = [], [], set()
+
+    def chat_update(self, **kw):
+        if kw["ts"] in self.lost_ts:
+            from slack_sdk.errors import SlackApiError
+            raise SlackApiError("message_not_found", {"ok": False, "error": "message_not_found"})
+        self.updates.append(kw)
+        return {"ts": kw["ts"]}
+
+    def chat_postEphemeral(self, **kw):
+        self.ephemeral.append(kw)
+
+
+def live_bot(tmp_path, cfg=None, minutes_ago=20, **plan_kw):
+    start = time.time() - minutes_ago * MIN
+    write_history(tmp_path, start)
+    bot = bot_with(cfg or make_settings(tmp_path), LiveSlack())
+    plan = running_plan(start, slack_channel="C1", slack_thread_ts="1.1", **plan_kw)
+    bot.tools.plans.put(plan)
+    return bot
+
+
+def image_block(msg):
+    (img,) = [b for b in msg["blocks"] if b["type"] == "image"]
+    return img
+
+
+def test_the_second_update_edits_the_first_card_in_place(tmp_path):
+    bot = live_bot(tmp_path)
+    bot.post_progress(bot.tools.plans.get("pio1"))
+    card_ts = bot.tools.plans.get("pio1").slack_card_ts
+    assert card_ts == bot.client.posts[0].get("ts", "1") and len(bot.client.posts) == 1
+    bot.post_progress(bot.tools.plans.get("pio1"))
+    assert len(bot.client.posts) == 1  # no second card
+    (update,) = bot.client.updates
+    assert update["channel"] == "C1" and update["ts"] == card_ts
+    first, second = image_block(bot.client.posts[0]), image_block(update)
+    assert first["block_id"] != second["block_id"]  # Slack keeps showing the old image under a reused block_id
+    assert second["slack_file"]["id"] != first["slack_file"]["id"]
+
+
+def test_a_deleted_card_is_replaced_by_a_new_one(tmp_path):
+    bot = live_bot(tmp_path)
+    bot.post_progress(bot.tools.plans.get("pio1"))
+    bot.client.lost_ts.add(bot.tools.plans.get("pio1").slack_card_ts)
+    bot.post_progress(bot.tools.plans.get("pio1"))
+    assert len(bot.client.posts) == 2
+    assert bot.tools.plans.get("pio1").slack_card_ts == "2"
+
+
+def test_the_card_appears_as_soon_as_the_plan_starts(tmp_path):
+    from slack_bot import Conversation
+
+    bot = live_bot(tmp_path, minutes_ago=0)
+    conv = Conversation(channel="C9", thread_ts="9.9", requester="U1")
+    bot.submit = lambda fn, *a: fn(*a)
+    bot.on_tool_result(conv, "start_experiment", {}, {"ok": True, "plan": {"unit": "pio1"}}, False)
+    assert bot.client.posts and bot.client.posts[0]["channel"] == "C9" and bot.client.posts[0]["thread_ts"] == "9.9"
+    assert bot.tools.plans.get("pio1").slack_card_ts == "1"
+
+
+def test_card_text_shows_the_current_setpoint(tmp_path):
+    import json
+
+    bot = live_bot(tmp_path)
+    state_path = bot.cfg.output.state_path
+    state = json.loads(state_path.read_text())
+    state["pio1"]["temperature"] = {"value": 30.1, "timestamp": datetime.now(timezone.utc).isoformat()}
+    state_path.write_text(json.dumps(state))
+    plan = bot.tools.plans.get("pio1")
+    plan.set_target("temperature", 33)
+    assert "target 33" in bot.progress_text(plan)
+
+
+def test_a_progress_update_does_not_lose_a_change_made_while_it_was_drawing(tmp_path):
+    bot = live_bot(tmp_path, update_every_h=0.1)
+    plan = bot.tools.plans.get("pio1")
+    plan.last_update_at = datetime.fromtimestamp(time.time() - 3600, timezone.utc).isoformat()
+    bot.tools.plans.put(plan)
+    real = bot.post_progress
+
+    def slow_post(p, final=False):
+        changed = bot.tools.plans.get("pio1")  # someone applies a change meanwhile
+        changed.set_target("stirring", 350)
+        bot.tools.plans.put(changed)
+        real(p, final)
+
+    bot.post_progress = slow_post
+    bot.check_plans()
+    after = bot.tools.plans.get("pio1")
+    assert after.target("stirring") == 350 and after.last_update_at and after.slack_card_ts

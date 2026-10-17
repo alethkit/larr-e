@@ -73,9 +73,18 @@ class PioreactorConfig:
     default_unit: str | None = _env("LARRE_DEFAULT_UNIT")
     # If unset, the experiment is resolved from live telemetry, then from SQLite.
     experiment: str | None = _env("LARRE_EXPERIMENT")
-    # "mqtt": publish to pioreactor/<unit>/<exp>/run/<job> (works from any machine).
+    # How jobs and pumps are started:
+    # "rest": the leader's HTTP API, as the Pioreactor web UI and MCP server do (works from any machine).
+    # "mqtt": publish to pioreactor/<unit>/<exp>/run/<job>. Current Pioreactor releases have no
+    #         subscriber for this topic, so it is likely a silent no-op. Kept for older images.
     # "pios": shell out to `pios run ...` (only on the leader).
     pump_transport: str = _env("LARRE_PUMP_TRANSPORT", "mqtt")
+    # Leader web server (port 80 on a stock image). Used by the "rest" transport and experiment plans.
+    leader_url: str = _env("LARRE_LEADER_URL", "http://pioreactor.local")
+    # Leader's unit name: experiment profiles execute on the leader. In a one-Pi cluster it is the worker too.
+    leader_unit: str | None = _env("LARRE_LEADER_UNIT")
+    # Where the leader keeps profiles (the execute command needs the full path on the leader).
+    profile_dir: str = _env("LARRE_PROFILE_DIR", "/home/pioreactor/.pioreactor/experiment_profiles")
     dry_run: bool = _env_bool("LARRE_DRY_RUN", False)
 
 
@@ -131,6 +140,7 @@ class OutputConfig:
     state_path: Path = RUNTIME_DIR / "live_state.json"
     alerts_path: Path = RUNTIME_DIR / "alerts.jsonl"
     audit_path: Path = RUNTIME_DIR / "audit.jsonl"  # who requested and who approved each hardware action
+    plans_path: Path = RUNTIME_DIR / "experiment_plans.json"  # the active plan per unit
     plots_dir: Path = RUNTIME_DIR / "plots"
     # Webhook posting from listener.py. Leave unset when slack_bot.py is running,
     # which posts the same alerts itself with buttons and threads.
@@ -172,6 +182,19 @@ class ApiConfig:
 
 
 @dataclass(frozen=True)
+class PlanConfig:
+    """Experiment plans (experiment.py): one scheduled profile per unit, persisted across restarts."""
+
+    max_duration_h: float = _env_float("LARRE_MAX_EXPERIMENT_H", 72.0)
+    default_update_every_h: float = _env_float("LARRE_UPDATE_EVERY_H", 2.0)
+    # Pioreactor's own profile dry-run executes in real time (an 18 h profile logs for 18 h), so we
+    # don't use it as a pre-flight check. The leader validates a profile when it is uploaded instead.
+    # Slack channel for progress updates; falls back to the alert channel.
+    update_channel: str | None = _env("LARRE_SLACK_UPDATE_CHANNEL")
+    check_every_s: float = _env_float("LARRE_PLAN_CHECK_EVERY_S", 60.0)
+
+
+@dataclass(frozen=True)
 class Settings:
     mqtt: MQTTConfig = field(default_factory=MQTTConfig)
     topics: TopicConfig = field(default_factory=TopicConfig)
@@ -182,6 +205,7 @@ class Settings:
     output: OutputConfig = field(default_factory=OutputConfig)
     slack: SlackConfig = field(default_factory=SlackConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
+    plans: PlanConfig = field(default_factory=PlanConfig)
 
     def ensure_dirs(self) -> None:
         self.output.runtime_dir.mkdir(parents=True, exist_ok=True)

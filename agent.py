@@ -46,6 +46,15 @@ Leader SQLite schema (read-only):
 - dosing_events(experiment, pioreactor_unit, timestamp, event, volume_change_ml, source_of_event)
 Timestamps are ISO-8601 UTC strings, so they sort and compare as text.
 
+Experiments:
+- When someone describes a whole experiment ("37 °C, 180 rpm for 18 hours, keep me posted"), use
+  start_experiment, not separate start_job calls. It becomes a Pioreactor experiment profile, so the
+  Pioreactor itself runs the schedule and stops the jobs at the end, even if LARR-E goes offline.
+- If anything that matters is missing (duration, temperature, speed), ask. Use plan_experiment to show
+  the plan before starting it if the user wants to review it first.
+- The <context> block carries the active plan's expected state. Read changes against it: a job
+  stopping at the planned end is not a fault.
+
 Rules:
 - Prefer the purpose-built tools (plot_timeseries, get_recent_timeseries, get_live_status) over raw SQL.
 - Make one hardware change per request unless the user clearly asked for several.
@@ -64,6 +73,13 @@ QUERY_MODE_NOTE = (
 TRIAGE_PROMPT = """An automated anomaly alert just fired:
 
 {alert}
+
+What the experiment plan says should be happening on this unit right now (null: no plan on file):
+
+{plan}
+
+If the plan explains the change (e.g. jobs stopped because the experiment reached its end), say so
+in one line and recommend no action.
 
 Investigate with the read-only tools (recent time series around the event, live status, recent
 alerts) and write a short triage note: the likely cause (sensor artifact, e.g. a bubble or vial
@@ -125,7 +141,48 @@ READ_TOOLS = [
     ),
 ]
 
+EXPERIMENT_PROPS = {
+    "name": {"type": "string", "description": "Short human name, e.g. 'E. coli overnight'."},
+    "duration_h": {"type": "number", "exclusiveMinimum": 0, "description": "Total run time in hours."},
+    "temperature_c": {"type": "number", "description": "Thermostat target. Omit to leave temperature uncontrolled."},
+    "rpm": {"type": "number", "exclusiveMinimum": 0, "description": "Stirring target. Omit for no stirring."},
+    "od_reading": {"type": "boolean", "description": "Measure OD (default true)."},
+    "growth_rate": {"type": "boolean", "description": "Compute growth rate from OD (default: same as od_reading)."},
+    "update_every_h": {"type": "number", "description": "Hours between Slack progress updates (default 2)."},
+    "unit": UNIT,
+    "notes": {"type": "string", "description": "Anything else the scientist said: organism, media, purpose."},
+}
+
+READ_TOOLS += [
+    _tool(
+        "plan_experiment",
+        "Preview an experiment without starting it: returns the plan and the Pioreactor experiment profile "
+        "YAML it would run. Changes nothing.",
+        EXPERIMENT_PROPS,
+        ["name", "duration_h"],
+    ),
+    _tool(
+        "get_experiment_plan",
+        "The stored experiment plan(s): what was asked for, when it started, when it ends, expected state.",
+        {"unit": UNIT},
+        [],
+    ),
+]
+
 ACTION_TOOLS = [
+    _tool(
+        "start_experiment",
+        "Start a complete experiment: uploads a Pioreactor experiment profile that starts the jobs now and "
+        "stops them after duration_h, runs it on the leader, and stores the plan for monitoring and updates.",
+        EXPERIMENT_PROPS,
+        ["name", "duration_h"],
+    ),
+    _tool(
+        "stop_experiment",
+        "Stop the running experiment on a unit before its scheduled end (stops the profile and its jobs).",
+        {"unit": UNIT},
+        [],
+    ),
     _tool(
         "dose",
         "Run a peristaltic pump once. Give exactly one of ml or duration_s.",
@@ -199,6 +256,7 @@ class LarreAgent:
         self.default_unit = default_unit or cfg.pioreactor.default_unit
         self.verbose = verbose
         self.on_tool_result = on_tool_result
+        self.requester = ""  # set by front ends so plans record who asked
         self.client = anthropic.Anthropic()
         self.messages: list[dict[str, Any]] = []
         self.tool_specs = READ_TOOLS + (ACTION_TOOLS if mode == "exec" else [])
@@ -223,9 +281,15 @@ class LarreAgent:
             "set_stirring_rpm": t.set_stirring_rpm,
             "start_job": t.start_job,
             "stop_job": t.stop_job,
+            "plan_experiment": t.plan_experiment,
+            "get_experiment_plan": t.get_experiment_plan,
+            "start_experiment": t.start_experiment,
+            "stop_experiment": t.stop_experiment,
         }
         if name not in handlers or name not in {s["name"] for s in self.tool_specs}:
             raise ToolError(f"Tool {name} is not available in {self.mode} mode.")
+        if name == "start_experiment" and self.requester:
+            args.setdefault("requested_by", self.requester)
         if name in ACTION_TOOL_NAMES and not self.confirm(name, args):
             return {"ok": False, "declined": True, "note": "The operator declined this action. Nothing was changed."}
         return handlers[name](**args)
@@ -273,6 +337,7 @@ class LarreAgent:
             "now_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "default_unit": self.default_unit,
             "mode": self.mode,
+            "experiment_plan": self.tools.active_plan_context(self.default_unit),
         }
         self.messages.append(
             {"role": "user", "content": f"<context>{json.dumps(context)}</context>\n\n{prompt}"}
@@ -303,7 +368,8 @@ class LarreAgent:
 def triage_alert(alert: dict[str, Any], cfg: Settings = default_settings) -> str:
     """Read-only investigation of an alert; called by listener.py."""
     agent = LarreAgent(mode="query", cfg=cfg, default_unit=alert.get("unit"), verbose=False)
-    return agent.ask(TRIAGE_PROMPT.format(alert=json.dumps(alert, indent=2)))
+    plan = agent.tools.active_plan_context(alert.get("unit"))
+    return agent.ask(TRIAGE_PROMPT.format(alert=json.dumps(alert, indent=2), plan=json.dumps(plan, indent=2)))
 
 
 # ------------------------------------------------------------------ CLI

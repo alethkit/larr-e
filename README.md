@@ -31,6 +31,8 @@ act on the hardware in plain English, with hard safety limits and a human confir
 | `api_server.py` | Local HTTP API (`larr-e api`): status, alerts, data, agent jobs and approvals, behind a token |
 | `web/dashboard.html` | Dashboard for small, old browsers, including the Nintendo 3DS browser. Served by the API |
 | `pocket3ds/` | Native Nintendo 3DS app (PocketJS) and the bridge that pairs it with the API. See [pocket3ds/README.md](pocket3ds/README.md) |
+| `experiment.py` | Experiment plans: request → Pioreactor experiment profile YAML, persisted plan, expected state, update timing |
+| `leader_api.py` | Small client for the leader's REST API: start/stop jobs, upload and run profiles |
 | `inject_anomaly.py` | Demo helper that publishes Pioreactor-format fake telemetry to trigger alerts on cue |
 
 ---
@@ -56,11 +58,13 @@ History comes from the leader's SQLite database
 `growth_rates`, `stirring_rates`, `dosing_events`, `experiments`. It is opened read-only, and an
 SQLite authorizer rejects any statement that is not a read.
 
-> **Check against your Pioreactor software version.** These topics match the published Pioreactor
-> conventions, but the `run/<job>` command path and payload have changed between releases. Before
-> demo day, confirm in a dry run that one `larr-e exec "pump 0.5 ml of media"` actually spins the
-> pump. If it doesn't, run the agent on the leader with `LARRE_PUMP_TRANSPORT=pios`, which
-> shells out to `pios run add_media --units <unit> --ml …` instead.
+> **Check against your Pioreactor software version.** Changing a setting (`…/set`) and stopping a
+> job (`$state/set`) over MQTT are stable. *Starting* a job is not: current Pioreactor releases
+> (checked against the 26.11 source) have no subscriber for `pioreactor/<unit>/<exp>/run/<job>`, so
+> the default `mqtt` transport is likely a silent no-op there. Use `LARRE_PUMP_TRANSPORT=rest`,
+> which calls the leader's web API (`POST /api/workers/<unit>/jobs/run/job_name/<job>/experiments/<exp>`,
+> the same call the Pioreactor UI and MCP server make), or `pios` when running on the leader.
+> Before demo day, confirm that one `larr-e exec "pump 0.5 ml of media"` actually spins the pump.
 
 ---
 
@@ -92,6 +96,10 @@ export LARRE_DB_PATH=/home/pioreactor/.pioreactor/storage/pioreactor.sqlite
 # Slack: see section 4. (LARRE_SLACK_WEBHOOK_URL is a no-bot fallback; don't set it while the bot runs, or alerts post twice.)
 export LARRE_EFFORT=low                      # snappier answers on stage (default: medium)
 export LARRE_API_TOKEN=pick-a-long-random-string   # for `larr-e api`, the 3DS bridge and dashboard
+export LARRE_PUMP_TRANSPORT=rest             # start jobs via the leader's web API (see section 1)
+export LARRE_LEADER_URL=http://pioreactor.local   # the leader's web UI address
+export LARRE_LEADER_UNIT=pioreactor          # leader's unit name; defaults to the target unit (one-Pi cluster)
+export LARRE_UPDATE_EVERY_H=2                # default spacing of Slack progress updates
 ```
 
 Run the agent **on the leader** to get direct DB access. To run it from a laptop, copy the DB over
@@ -126,6 +134,36 @@ larr-e listen [--no-triage]
 larr-e slack                                        # Slack bot front end (section 4)
 larr-e api                                          # HTTP API + 3DS/phone dashboard (section 5)
 ```
+
+**Whole experiments**
+
+```bash
+larr-e exec "run the vial at 37 degrees and 180 rpm for 18 hours, update me every 2 hours"
+larr-e query "how is the experiment going?"
+larr-e exec "stop the experiment"
+```
+
+LARR-E doesn't drive a long experiment one command at a time. It turns the request into an
+`ExperimentPlan` (`experiment.py`) and from that a Pioreactor
+[experiment profile](https://docs.pioreactor.com/user-guide/experiment-profiles-schema) that
+starts stirring, the thermostat, OD reading and growth rate at t = 0 and stops them at t = 18 h.
+The leader validates the profile on upload, then runs it. **The Pioreactor owns the schedule**, so
+the experiment ends correctly even if the laptop, the bot or the Claude API goes away.
+
+LARR-E keeps the plan in `runtime/experiment_plans.json` (one per unit, survives restarts) and uses it to:
+- show the approver the exact profile YAML on the Approve/Deny card,
+- tell triage and the agent what is *supposed* to be happening (`expected_state`), so a job
+  stopping at the planned end isn't reported as a fault,
+- post progress updates (status line + plot, no LLM call) to the Slack thread that started the
+  experiment every `update_every_h`, and a final message at the end. `/larr-e experiment` shows it on demand.
+
+`plan_experiment` previews without touching anything. `start_experiment` and `stop_experiment` need approval.
+LARR-E refuses to start a second plan on a unit that already has one running. Pioreactor's own
+profile dry-run executes in real time, so we don't use it as a pre-flight check.
+
+Tests: `pytest tests/` (no hardware, Slack or API key). To also check the generated profile
+against Pioreactor's own schema validator, clone `Pioreactor/pioreactor` and run with
+`PYTHONPATH=pioreactor/core GLOBAL_CONFIG=pioreactor/config.dev.ini TESTING=1`.
 
 **Safety model**
 - `query` mode never offers hardware tools to the model.
@@ -241,7 +279,7 @@ Approvals from any front end are logged in `runtime/audit.jsonl`, tagged with th
 ### T-30 min pre-flight checklist
 1. `ping pioreactor.local`, then `larr-e status`: the demo unit shows live OD, temperature and RPM.
 2. Start `od_reading`, `growth_rate_calculating`, `stirring` (500 RPM) and the thermostat (30 °C) from the Pioreactor UI.
-3. `larr-e exec "pump 0.5ml of media" --yes`: **the pump must audibly run.** If not, switch to `LARRE_PUMP_TRANSPORT=pios`.
+3. `larr-e exec "pump 0.5ml of media" --yes`: **the pump must audibly run.** If not, switch to `LARRE_PUMP_TRANSPORT=rest` (or `pios` on the leader).
 4. `larr-e query "plot the last 10 minutes of OD against temperature"` renders a chart.
 5. `export LARRE_ALERT_COOLDOWN_S=20`, so you can re-trigger if a judge asks.
 6. Clear old alerts: `rm runtime/alerts.jsonl`. Leave `larr-e listen` running in pane A.

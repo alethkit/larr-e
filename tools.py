@@ -26,6 +26,8 @@ from typing import Any
 import paho.mqtt.publish as mqtt_publish
 
 from config import Settings, settings as default_settings
+from experiment import ExperimentPlan, PlanStore
+from leader_api import LeaderAPI, LeaderAPIError
 
 
 class ToolError(Exception):
@@ -97,6 +99,8 @@ class PioreactorTools:
         self.cfg = cfg
         self.dry_run = cfg.pioreactor.dry_run if dry_run is None else dry_run
         self.render_terminal = render_terminal
+        self.leader = LeaderAPI(cfg.pioreactor.leader_url)
+        self.plans = PlanStore(cfg.output.plans_path)
         cfg.ensure_dirs()
 
     # ------------------------------------------------------------------ context
@@ -160,6 +164,8 @@ class PioreactorTools:
     def _run_job(self, unit: str, job: str, options: dict[str, Any]) -> dict[str, Any]:
         if self.cfg.pioreactor.pump_transport == "pios":
             return self._run_job_pios(unit, job, options)
+        if self.cfg.pioreactor.pump_transport == "rest":
+            return self._run_job_rest(unit, job, options)
         exp = self.resolve_experiment(unit)
         payload = json.dumps({"options": options, "args": []})
         return self._publish(f"pioreactor/{unit}/{exp}/run/{job}", payload)
@@ -174,6 +180,17 @@ class PioreactorTools:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if proc.returncode != 0:
             raise ToolError(f"`{record['command']}` failed: {proc.stderr.strip() or proc.stdout.strip()}")
+        return record
+
+    def _run_job_rest(self, unit: str, job: str, options: dict[str, Any]) -> dict[str, Any]:
+        exp = self.resolve_experiment(unit)
+        record: dict[str, Any] = {"transport": "rest", "job": job, "experiment": exp, "dry_run": self.dry_run}
+        if self.dry_run:
+            return record
+        try:
+            record["leader_response"] = self.leader.run_job(unit, job, exp, options)
+        except LeaderAPIError as exc:
+            raise ToolError(str(exc)) from exc
         return record
 
     # ------------------------------------------------------------------ actuators
@@ -249,6 +266,121 @@ class PioreactorTools:
         unit = self.resolve_unit(unit)
         result = self._set_attribute(unit, job, "$state", "disconnected")
         return {"ok": True, "unit": unit, "job": job, "state": "disconnected", **result}
+
+    # ------------------------------------------------------------------ experiment plans
+
+    def _build_plan(
+        self,
+        name: str,
+        duration_h: float,
+        temperature_c: float | None = None,
+        rpm: float | None = None,
+        od_reading: bool = True,
+        growth_rate: bool | None = None,
+        update_every_h: float | None = None,
+        unit: str | None = None,
+        notes: str = "",
+        requested_by: str = "",
+    ) -> ExperimentPlan:
+        unit = self.resolve_unit(unit)
+        plan = ExperimentPlan(
+            name=name,
+            unit=unit,
+            experiment=self.resolve_experiment(unit),
+            duration_h=float(duration_h),
+            temperature_c=None if temperature_c is None else float(temperature_c),
+            rpm=None if rpm is None else float(rpm),
+            od_reading=bool(od_reading),
+            growth_rate=bool(od_reading) if growth_rate is None else bool(growth_rate),
+            update_every_h=self.cfg.plans.default_update_every_h if update_every_h is None else float(update_every_h),
+            notes=notes,
+            requested_by=requested_by,
+        )
+        if plan.update_every_h and plan.update_every_h > plan.duration_h:
+            plan.update_every_h = plan.duration_h
+        try:
+            plan.validate(self.cfg)
+        except ValueError as exc:
+            raise ToolError(str(exc)) from exc
+        return plan
+
+    def plan_experiment(self, **kwargs: Any) -> dict[str, Any]:
+        """Read-only preview: the plan and the Pioreactor profile it becomes. Changes nothing."""
+        plan = self._build_plan(**kwargs)
+        current = self.plans.get(plan.unit)
+        return {
+            "plan": plan.public(),
+            "profile_yaml": plan.to_profile_yaml(),
+            "conflict": current.summary() if current and current.status == "running" else None,
+        }
+
+    def start_experiment(self, **kwargs: Any) -> dict[str, Any]:
+        """Upload the profile to the leader and execute it. Pioreactor then owns the schedule."""
+        plan = self._build_plan(**kwargs)
+        current = self.plans.get(plan.unit)
+        if current and current.status == "running":
+            raise ToolError(
+                f"{plan.unit} already runs '{current.summary()}'. Stop it with stop_experiment first: "
+                "two profiles driving the same jobs interfere with each other."
+            )
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        plan.profile_filename = f"{plan.profile_name()}-{stamp}.yaml"
+        yaml_body = plan.to_profile_yaml()
+        leader_unit = self.cfg.pioreactor.leader_unit or plan.unit
+        full_path = f"{self.cfg.pioreactor.profile_dir.rstrip('/')}/{plan.profile_filename}"
+        record: dict[str, Any] = {"dry_run": self.dry_run, "profile_path_on_leader": full_path}
+        if not self.dry_run:
+            try:
+                self.leader.upload_profile(plan.profile_filename, yaml_body)
+            except LeaderAPIError as exc:
+                raise ToolError(f"The leader rejected the profile: {exc}") from exc
+            try:
+                record["leader_response"] = self.leader.run_profile(leader_unit, full_path, plan.experiment)
+            except LeaderAPIError as exc:
+                plan.status = "failed"
+                self.plans.put(plan)
+                raise ToolError(f"Profile uploaded but did not start: {exc}") from exc
+        plan.status = "running"
+        plan.started_at = utc_timestamp()
+        self.plans.put(plan)
+        return {"ok": True, "plan": plan.public(), "profile_yaml": yaml_body, **record}
+
+    def get_experiment_plan(self, unit: str | None = None) -> dict[str, Any]:
+        if unit:
+            plan = self.plans.get(self.resolve_unit(unit))
+            return {"plan": plan.public() if plan else None}
+        return {"plans": [p.public() for p in self.plans.all()]}
+
+    def stop_experiment(self, unit: str | None = None) -> dict[str, Any]:
+        """Stop the running profile and the jobs it started, before its scheduled end."""
+        unit = self.resolve_unit(unit)
+        plan = self.plans.get(unit)
+        if not plan or plan.status != "running":
+            raise ToolError(f"No running experiment plan on {unit}.")
+        stopped, errors = [], []
+        if not self.dry_run:
+            leader_unit = self.cfg.pioreactor.leader_unit or unit
+            # Killing a profile stops the jobs it started; stopping them explicitly as well is harmless.
+            calls = [(leader_unit, "experiment_profile")] + [(unit, job) for job in plan.jobs()]
+            for target, job in calls:
+                try:
+                    self.leader.stop_job(target, job, plan.experiment)
+                    stopped.append(job)
+                except LeaderAPIError as exc:
+                    errors.append(f"{job}: {exc}")
+        plan.status, plan.ended_at = "stopped", utc_timestamp()
+        self.plans.put(plan)
+        return {"ok": not errors, "unit": unit, "stopped": stopped, "errors": errors, "dry_run": self.dry_run}
+
+    def active_plan_context(self, unit: str | None) -> dict[str, Any] | None:
+        """Expected state for the agent and triage; None when there is no plan."""
+        try:
+            plan = self.plans.get(self.resolve_unit(unit))
+        except ToolError:
+            return None
+        if not plan:
+            return None
+        return {"summary": plan.summary(), "status": plan.status, **plan.expected_state()}
 
     # ------------------------------------------------------------------ SQLite
 

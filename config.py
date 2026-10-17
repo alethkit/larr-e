@@ -73,9 +73,12 @@ class PioreactorConfig:
     default_unit: str | None = _env("LARRE_DEFAULT_UNIT")
     # If unset, the experiment is resolved from live telemetry, then from SQLite.
     experiment: str | None = _env("LARRE_EXPERIMENT")
-    # "mqtt": publish to pioreactor/<unit>/<exp>/run/<job> (works from any machine).
+    # How jobs are started, changed and stopped:
+    # "http": the leader's web API, /api/workers/<unit>/jobs/... (Pioreactor 25+; works from any machine).
+    # "mqtt": publish to pioreactor/<unit>/<exp>/run/<job> and .../<attr>/set (older Pioreactor software).
     # "pios": shell out to `pios run ...` (only on the leader).
-    pump_transport: str = _env("LARRE_PUMP_TRANSPORT", "mqtt")
+    pump_transport: str = _env("LARRE_JOB_TRANSPORT", _env("LARRE_PUMP_TRANSPORT", "mqtt"))
+    leader_url: str = _env("LARRE_LEADER_URL", "http://pioreactor.local")
     dry_run: bool = _env_bool("LARRE_DRY_RUN", False)
 
 
@@ -115,6 +118,9 @@ class AnomalyConfig:
 
 @dataclass(frozen=True)
 class LLMConfig:
+    # "anthropic" (Claude, the default), "hf" (open models via Hugging Face Inference Providers)
+    # or "gemini" (Google Gemini; free tier via aistudio.google.com).
+    provider: str = _env("LARRE_LLM", "anthropic")
     model: str = _env("LARRE_MODEL", "claude-opus-5-5")
     # low | medium | high | xhigh | max. "low" gives snappier stage responses.
     effort: str = _env("LARRE_EFFORT", "medium")
@@ -123,6 +129,15 @@ class LLMConfig:
     # Server-side refusal fallback: if the primary model declines, the API reruns
     # the request on a fallback model inside the same call.
     use_fallbacks: bool = _env_bool("LARRE_USE_FALLBACKS", True)
+    # Hugging Face backend. Append ":cheapest" or ":<provider>" to the model to pick a provider.
+    hf_model: str = _env("LARRE_HF_MODEL", "openai/gpt-oss-120b:fastest")
+    hf_base_url: str = _env("LARRE_HF_BASE_URL", "https://router.huggingface.co/v1")
+    hf_max_tokens: int = _env_int("LARRE_HF_MAX_TOKENS", 8192)
+    # Gemini backend (OpenAI-compatible endpoint). Check your free-tier models at aistudio.google.com/rate-limit.
+    gemini_model: str = _env("LARRE_GEMINI_MODEL", "gemini-3.8-flash")
+    gemini_base_url: str = _env("LARRE_GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+    # Optional reasoning_effort for hf/gemini (e.g. low | medium | high); support varies by model.
+    reasoning_effort: str | None = _env("LARRE_REASONING_EFFORT", _env("LARRE_HF_REASONING_EFFORT"))
 
 
 @dataclass(frozen=True)
@@ -169,6 +184,9 @@ class ApiConfig:
     approval_timeout_s: float = _env_float("LARRE_API_APPROVAL_TIMEOUT_S", 180.0)
     workers: int = _env_int("LARRE_API_WORKERS", 4)
     max_jobs: int = _env_int("LARRE_API_MAX_JOBS", 100)
+    # Which preset requests the 3DS / dashboard show, in order (the 3DS shows the first four).
+    # Available: summary, triage, trend, dilute, stir, heat, stop.
+    presets: str = _env("LARRE_PRESETS", "summary,triage,trend,dilute")
 
 
 @dataclass(frozen=True)

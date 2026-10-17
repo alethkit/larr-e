@@ -1,11 +1,16 @@
 """Hardware and data toolset that the LLM routing layer calls.
 
-Actuators talk to the Pioreactor cluster over MQTT using the same topics the
-Pioreactor web UI uses:
+Actuators reach the Pioreactor cluster through one of three transports (LARRE_JOB_TRANSPORT):
 
-* change a running job's setting:  pioreactor/<unit>/<exp>/<job>/<attr>/set
-* stop a job:                      pioreactor/<unit>/<exp>/<job>/$state/set  -> "disconnected"
-* start a job (e.g. a pump):       pioreactor/<unit>/<exp>/run/<job>  -> {"options": {...}, "args": []}
+* "http" (Pioreactor 25+), the leader's web API, as the web UI uses it:
+    start   POST /api/workers/<unit>/jobs/run/job_name/<job>/experiments/<exp>     {"options": {...}}
+    change  POST /api/workers/<unit>/jobs/update/job_name/<job>/experiments/<exp>  {"settings": {...}}
+    stop    POST /api/workers/<unit>/jobs/stop/job_name/<job>/experiments/<exp>
+* "mqtt" (older software):
+    change  pioreactor/<unit>/<exp>/<job>/<attr>/set
+    stop    pioreactor/<unit>/<exp>/<job>/$state/set  -> "disconnected"
+    start   pioreactor/<unit>/<exp>/run/<job>  -> {"options": {...}, "args": []}
+* "pios": `pios run ...` on the leader.
 
 Reads come from the leader's SQLite database (opened read-only) and from the
 live state snapshot that listener.py keeps up to date.
@@ -18,6 +23,9 @@ import shlex
 import sqlite3
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -155,14 +163,71 @@ class PioreactorTools:
 
     def _set_attribute(self, unit: str, job: str, attr: str, value: Any) -> dict[str, Any]:
         exp = self.resolve_experiment(unit)
+        if self.cfg.pioreactor.pump_transport == "http":
+            if attr == "$state" and value == "disconnected":
+                return self._job_http("stop", unit, job, exp, None)
+            return self._job_http("update", unit, job, exp, {"settings": {attr: value}})
         return self._publish(f"pioreactor/{unit}/{exp}/{job}/{attr}/set", str(value))
 
     def _run_job(self, unit: str, job: str, options: dict[str, Any]) -> dict[str, Any]:
         if self.cfg.pioreactor.pump_transport == "pios":
             return self._run_job_pios(unit, job, options)
+        if self.cfg.pioreactor.pump_transport == "http":
+            return self._job_http("run", unit, job, self.resolve_experiment(unit), {"options": options})
         exp = self.resolve_experiment(unit)
         payload = json.dumps({"options": options, "args": []})
         return self._publish(f"pioreactor/{unit}/{exp}/run/{job}", payload)
+
+    # ------------------------------------------------------------------ leader web API
+
+    def _http_json(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        url = self.cfg.pioreactor.leader_url.rstrip("/") + path
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            raise ToolError(f"Pioreactor API {exc.code} on {path}: {exc.read()[:200].decode(errors='replace')}") from exc
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise ToolError(f"Pioreactor API unreachable at {url}: {exc}") from exc
+
+    def _await_task(self, task: dict[str, Any], seconds: float) -> dict[str, Any]:
+        """The leader queues work and returns a task; poll it so we report what actually happened."""
+        result_path, deadline = task.get("result_url_path"), time.monotonic() + seconds
+        while result_path and task.get("status") not in ("succeeded", "failed") and time.monotonic() < deadline:
+            time.sleep(0.5)
+            task = self._http_json("GET", result_path)
+        return task
+
+    def running_jobs(self, unit: str | None = None) -> set[str] | None:
+        """Names of jobs running on a unit, from the leader's web API (read-only). None if unknown."""
+        if self.cfg.pioreactor.pump_transport != "http":
+            return None
+        unit = self.resolve_unit(unit)
+        try:
+            task = self._await_task(self._http_json("GET", f"/api/workers/{urllib.parse.quote(unit)}/jobs/running"), 5)
+            jobs = task["result"][unit]["value"]
+            return {j["job_name"] for j in jobs if j.get("is_running")}
+        except (ToolError, KeyError, TypeError):
+            return None
+
+    def _job_http(self, action: str, unit: str, job: str, exp: str, body: dict[str, Any] | None) -> dict[str, Any]:
+        path = (f"/api/workers/{urllib.parse.quote(unit)}/jobs/{action}/job_name/{urllib.parse.quote(job)}"
+                f"/experiments/{urllib.parse.quote(exp)}")
+        record: dict[str, Any] = {"http": f"POST {path}", "body": body, "dry_run": self.dry_run}
+        if self.dry_run:
+            return record
+        task = self._await_task(self._http_json("POST", path, body), 8)
+        status = task.get("status")
+        per_unit = task.get("result") if isinstance(task.get("result"), dict) else {}
+        failures = [f"{u}: {r.get('error') or r}" for u, r in per_unit.items() if isinstance(r, dict) and not r.get("ok")]
+        if status == "failed" or failures:
+            raise ToolError(f"Pioreactor {action} {job} failed: {'; '.join(failures) or task}"[:300])
+        record["status"] = status or "accepted"
+        if status not in ("succeeded", "failed"):
+            record["note"] = "Accepted by the leader; still running after 8 s, check the Pioreactor UI."
+        return record
 
     def _run_job_pios(self, unit: str, job: str, options: dict[str, Any]) -> dict[str, Any]:
         cmd = ["pios", "run", job, "--units", unit, "-y"]
@@ -177,6 +242,8 @@ class PioreactorTools:
         return record
 
     # ------------------------------------------------------------------ actuators
+    # Each actuator validates against SafetyLimits first. check_only=True stops after
+    # validation, so an out-of-limit request is rejected before anyone is asked to confirm it.
 
     def dose(
         self,
@@ -184,6 +251,7 @@ class PioreactorTools:
         unit: str | None = None,
         ml: float | None = None,
         duration_s: float | None = None,
+        check_only: bool = False,
     ) -> dict[str, Any]:
         if pump not in PUMP_JOBS:
             raise ToolError(f"pump must be one of {sorted(PUMP_JOBS)}")
@@ -199,16 +267,20 @@ class PioreactorTools:
                 raise ToolError(f"duration_s must be in (0, {limits.max_dose_duration_s}] (safety limit).")
             options = {"duration": round(float(duration_s), 2)}
         unit = self.resolve_unit(unit)
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
         result = self._run_job(unit, PUMP_JOBS[pump], options)
         return {"ok": True, "action": PUMP_JOBS[pump], "unit": unit, **options, **result}
 
-    def set_target_temperature(self, celsius: float, unit: str | None = None) -> dict[str, Any]:
+    def set_target_temperature(self, celsius: float, unit: str | None = None, check_only: bool = False) -> dict[str, Any]:
         limits = self.cfg.safety
         if not limits.min_temperature_c <= celsius <= limits.max_temperature_c:
             raise ToolError(
                 f"Target must be within {limits.min_temperature_c}-{limits.max_temperature_c} °C."
             )
         unit = self.resolve_unit(unit)
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
         result = self._set_attribute(unit, "temperature_automation", "target_temperature", round(celsius, 2))
         return {
             "ok": True,
@@ -218,14 +290,18 @@ class PioreactorTools:
             **result,
         }
 
-    def set_stirring_rpm(self, rpm: float, unit: str | None = None) -> dict[str, Any]:
+    def set_stirring_rpm(self, rpm: float, unit: str | None = None, check_only: bool = False) -> dict[str, Any]:
         if not 0 <= rpm <= self.cfg.safety.max_stirring_rpm:
             raise ToolError(f"rpm must be within 0-{self.cfg.safety.max_stirring_rpm}.")
         unit = self.resolve_unit(unit)
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
         result = self._set_attribute(unit, "stirring", "target_rpm", round(rpm))
         return {"ok": True, "unit": unit, "target_rpm": round(rpm), **result}
 
-    def start_job(self, job: str, unit: str | None = None, options: dict[str, Any] | None = None) -> dict[str, Any]:
+    def start_job(
+        self, job: str, unit: str | None = None, options: dict[str, Any] | None = None, check_only: bool = False
+    ) -> dict[str, Any]:
         if job not in STARTABLE_JOBS:
             raise ToolError(f"job must be one of {sorted(STARTABLE_JOBS)}")
         options = dict(options or {})
@@ -240,13 +316,17 @@ class PioreactorTools:
             if not 0 <= float(options["target_rpm"]) <= self.cfg.safety.max_stirring_rpm:
                 raise ToolError(f"target_rpm must be within 0-{self.cfg.safety.max_stirring_rpm}.")
         unit = self.resolve_unit(unit)
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
         result = self._run_job(unit, job, options)
         return {"ok": True, "unit": unit, "job": job, "options": options, **result}
 
-    def stop_job(self, job: str, unit: str | None = None) -> dict[str, Any]:
+    def stop_job(self, job: str, unit: str | None = None, check_only: bool = False) -> dict[str, Any]:
         if job not in STOPPABLE_JOBS:
             raise ToolError(f"job must be one of {sorted(STOPPABLE_JOBS)}")
         unit = self.resolve_unit(unit)
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
         result = self._set_attribute(unit, job, "$state", "disconnected")
         return {"ok": True, "unit": unit, "job": job, "state": "disconnected", **result}
 

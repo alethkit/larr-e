@@ -79,8 +79,15 @@ SQLite authorizer rejects any statement that is not a read.
 - Calibrated pumps if you want to dose by **ml** (otherwise dose by duration, e.g. "run the media pump for 2 seconds")
 
 ### Install
+With [uv](https://docs.astral.sh/uv/) (versions pinned in `uv.lock`):
 ```bash
 git clone <your repo> larr-e && cd larr-e
+uv sync                          # creates .venv; add --group dev for the tests
+uv run larr-e status             # or `source .venv/bin/activate` and just `larr-e ...`
+uv run --group dev pytest        # tests (no hardware, Slack or API key)
+```
+Without uv (e.g. on the Pi):
+```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 alias larr-e="python $(pwd)/agent.py"

@@ -120,5 +120,25 @@ def test_http_routes(tmp_path, leader):
 
         with urllib.request.urlopen(f"{base}/api/plan?k=tok&unit=pio1") as r:
             assert json.loads(r.read()) == {"plan": None}
+
+        # the configured default unit is listed even before it streams anything
+        with urllib.request.urlopen(f"{base}/api/units?k=tok") as r:
+            assert [u["unit"] for u in json.loads(r.read())["units"]] == ["pio1"]
     finally:
         server.shutdown()
+
+
+def test_series_carries_a_time_for_each_point(tmp_path, leader):
+    # Stirring comes from the listener's history; the ghost line needs to know when each point was.
+    t0 = time.time() - 600
+    stamps = [t0 + 10 * i for i in range(60)]
+    (tmp_path / "live_state.json").write_text(json.dumps({"pio1": {
+        "experiment": "demo",
+        "history": {"stirring": [180.0 + i for i in range(60)]},
+        "history_t": {"stirring": stamps},
+    }}))
+    svc = LarreService(make_settings(tmp_path, leader.url))
+    out = svc.series("stirring", "pio1", 30, 6)
+    assert len(out["t"]) == len(out["values"]) == 6
+    assert out["t"] == sorted(out["t"])
+    assert stamps[0] <= out["t"][0] and out["t"][-1] <= stamps[-1]

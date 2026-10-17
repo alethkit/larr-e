@@ -1,1 +1,434 @@
-<!doctype html><title>LARR-E plan</title>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LARR-E plan</title>
+<style>
+/* Plan editor for a laptop or phone (not the 3DS): drag a number, see the profile and the target line move. */
+:root {
+  --bg: #f6f7f5; --panel: #ffffff; --ink: #1c2421; --muted: #6b7570; --line: #dfe3e0;
+  --accent: #0f766e; --accent-soft: #ccebe6; --ghost: #0f766e; --actual: #1c2421;
+  --bad: #c2410c; --bad-soft: #fde4d6; --changed: #fef3c7;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1412; --panel: #161e1b; --ink: #e5ece9; --muted: #8b9792; --line: #26312d;
+    --accent: #2dd4bf; --accent-soft: #123b36; --ghost: #2dd4bf; --actual: #e5ece9;
+    --bad: #fb923c; --bad-soft: #3b2216; --changed: #3a3214;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1412; --panel: #161e1b; --ink: #e5ece9; --muted: #8b9792; --line: #26312d;
+  --accent: #2dd4bf; --accent-soft: #123b36; --ghost: #2dd4bf; --actual: #e5ece9;
+  --bad: #fb923c; --bad-soft: #3b2216; --changed: #3a3214;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+       font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 40px; }
+header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+h1 { font-size: 18px; margin: 0; letter-spacing: .02em; }
+h1 b { color: var(--accent); }
+.muted { color: var(--muted); font-size: 13px; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+.sentence { font-size: clamp(22px, 4vw, 34px); line-height: 1.6; margin: 0 0 6px; }
+.num { display: inline-block; min-width: 1.6ch; padding: 0 .25em; border-radius: 6px; cursor: ew-resize;
+       color: var(--accent); background: var(--accent-soft); border-bottom: 2px dashed var(--accent);
+       user-select: none; touch-action: none; font-variant-numeric: tabular-nums; outline: none; }
+.num:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+.num.dragging { background: var(--accent); color: var(--panel); }
+.num.edited { border-bottom-style: solid; }
+select.unit { font: inherit; color: var(--accent); background: var(--accent-soft); border: 0;
+              border-bottom: 2px dashed var(--accent); border-radius: 6px; padding: 0 .2em; }
+.grid { display: grid; grid-template-columns: 1fr; gap: 16px; margin-top: 16px; }
+@media (min-width: 860px) { .grid { grid-template-columns: 3fr 2fr; } }
+.chart { margin-bottom: 12px; }
+.chart h3 { font-size: 13px; font-weight: 600; margin: 0 0 4px; display: flex; justify-content: space-between; }
+.chart svg { width: 100%; height: 150px; display: block; overflow: visible; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-top: 4px; }
+.legend i { display: inline-block; width: 18px; height: 0; vertical-align: middle; margin-right: 4px; }
+pre { margin: 0; font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
+      word-break: break-word; }
+pre span.chg { background: var(--changed); transition: background 1.2s; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid var(--accent);
+         background: var(--accent); color: var(--panel); cursor: pointer; }
+button.ghost { background: transparent; color: var(--accent); }
+button.no { border-color: var(--bad); color: var(--bad); background: transparent; }
+button:disabled { opacity: .5; cursor: default; }
+#error { color: var(--bad); font-size: 14px; min-height: 1.5em; }
+.approval { margin-top: 12px; padding: 12px; border-radius: 8px; border: 2px solid var(--bad); background: var(--bad-soft); }
+.approval[hidden] { display: none; }
+.running { font-size: 14px; padding: 8px 12px; border-radius: 8px; background: var(--accent-soft); margin-bottom: 12px; }
+.running[hidden] { display: none; }
+input.name { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+             background: var(--bg); color: var(--ink); width: 14em; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><b>LARR-E</b> · plan</h1>
+    <span class="muted">Drag a highlighted number sideways (Shift for fine steps), or focus it and use the arrow keys.</span>
+  </header>
+
+  <div id="running" class="running" hidden></div>
+
+  <section class="panel">
+    <p class="sentence">
+      Run <select id="unit" class="unit" aria-label="unit"></select>
+      at <span class="num" tabindex="0" data-key="temperature_c" aria-label="temperature"></span> °C
+      and <span class="num" tabindex="0" data-key="rpm" aria-label="stirring speed"></span> rpm
+      for <span class="num" tabindex="0" data-key="minutes" aria-label="duration"></span>.
+    </p>
+    <div class="row">
+      <label class="muted">Name <input id="name" class="name" value="Plan from the page" maxlength="60"></label>
+      <button id="start">Start…</button>
+      <span id="error" role="status"></span>
+    </div>
+    <div id="approval" class="approval" hidden>
+      <strong>Waiting for approval.</strong>
+      <span id="approvalText"></span>
+      Approve here, or from any other LARR-E screen (3DS, dashboard).
+      <div class="row">
+        <button id="approve">Approve</button>
+        <button id="deny" class="no">Deny</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="grid">
+    <section class="panel">
+      <div class="chart"><h3><span>Temperature (°C)</span><span id="tempNow" class="muted"></span></h3><svg id="chartTemp"></svg></div>
+      <div class="chart"><h3><span>Stirring (rpm)</span><span id="rpmNow" class="muted"></span></h3><svg id="chartRpm"></svg></div>
+      <div class="legend">
+        <span><i style="border-top:2px dashed var(--ghost)"></i>target (the plan)</span>
+        <span><i style="border-top:2px solid var(--actual)"></i>measured</span>
+        <span><i style="border-top:6px solid var(--bad-soft)"></i>off target</span>
+        <span><i style="border-top:2px dotted var(--muted)"></i>now</span>
+      </div>
+    </section>
+    <section class="panel">
+      <h3 style="margin:0 0 8px;font-size:13px">Pioreactor experiment profile <span class="muted">(what the leader runs; no LLM in the loop)</span></h3>
+      <pre id="yaml"></pre>
+    </section>
+  </div>
+</main>
+
+<script>
+"use strict";
+const TOKEN = new URLSearchParams(location.search).get("k") || "";
+const $ = (id) => document.getElementById(id);
+const SVGNS = "http://www.w3.org/2000/svg";
+
+// Tolerances for "off target" shading. Heater warm-up and stirrer spin-up are forgiven at the start.
+const TOL = { temperature_c: 1.0, rpm_frac: 0.15, warmup_s: 600, spinup_s: 30 };
+
+const state = {
+  draft: { temperature_c: 30, rpm: 300, minutes: 5 },
+  limits: { temperature_c: [20, 50], rpm: [1, 1500], duration_h: [0.05, 72] },
+  running: null,   // the saved plan for the selected unit, if it is running
+  yaml: "",
+  series: { temperature: null, stirring: null },
+  job: null, approvalId: null,
+};
+
+async function api(method, path, body) {
+  const sep = path.includes("?") ? "&" : "?";
+  const r = await fetch(path + sep + "k=" + encodeURIComponent(TOKEN), {
+    method, headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+
+// ------------------------------------------------------------ draggable numbers
+
+const STEP = {
+  temperature_c: (v, fine) => fine ? 0.1 : 0.5,
+  rpm: (v, fine) => fine ? 1 : 10,
+  minutes: (v, fine) => fine ? 1 : (v < 60 ? 1 : v < 360 ? 15 : 60),
+};
+function bounds(key) {
+  if (key === "minutes") return state.limits.duration_h.map((h) => Math.round(h * 60 * 100) / 100);
+  return state.limits[key];
+}
+function showValue(key) {
+  const v = state.draft[key];
+  if (key === "minutes") return v < 60 ? `${v} min` : `${+(v / 60).toFixed(2)} h`;
+  if (key === "temperature_c") return (+v.toFixed(1)).toString();
+  return Math.round(v).toString();
+}
+function setValue(key, v) {
+  const [lo, hi] = bounds(key);
+  const step = STEP[key](v, true);
+  v = Math.min(hi, Math.max(lo, Math.round(v / step) * step));
+  state.draft[key] = key === "temperature_c" ? +v.toFixed(1) : Math.round(v);
+  if (key === "minutes") state.draft[key] = Math.max(Math.ceil(lo), state.draft[key]);
+  render();
+  schedulePreview();
+}
+
+document.querySelectorAll(".num").forEach((el) => {
+  const key = el.dataset.key;
+  let startX = 0, startV = 0, acc = 0;
+  el.addEventListener("pointerdown", (e) => {
+    el.setPointerCapture(e.pointerId);
+    startX = e.clientX; startV = state.draft[key]; acc = 0;
+    el.classList.add("dragging");
+  });
+  el.addEventListener("pointermove", (e) => {
+    if (!el.hasPointerCapture(e.pointerId)) return;
+    // 6 px per step; steps grow with the value for durations so 5 min and 18 h both feel right.
+    const steps = Math.trunc((e.clientX - startX) / 6);
+    if (steps === acc) return;
+    let v = startV;
+    const dir = Math.sign(steps);
+    for (let i = 0; i < Math.abs(steps); i++) v += dir * STEP[key](v, e.shiftKey);
+    acc = steps;
+    setValue(key, v);
+  });
+  const end = () => el.classList.remove("dragging");
+  el.addEventListener("pointerup", end);
+  el.addEventListener("pointercancel", end);
+  el.addEventListener("keydown", (e) => {
+    const dir = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1 }[e.key];
+    if (!dir) return;
+    e.preventDefault();
+    setValue(key, state.draft[key] + dir * STEP[key](state.draft[key], e.shiftKey));
+  });
+});
+
+// ------------------------------------------------------------ preview (YAML)
+
+let previewTimer = null;
+function draftBody() {
+  return {
+    name: $("name").value.trim() || "Plan from the page",
+    unit: $("unit").value || undefined,
+    temperature_c: state.draft.temperature_c,
+    rpm: state.draft.rpm,
+    duration_h: +(state.draft.minutes / 60).toFixed(4),
+  };
+}
+function schedulePreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(preview, 120);
+}
+async function preview() {
+  try {
+    const out = await api("POST", "/api/plan/preview", draftBody());
+    state.limits = out.limits;
+    showYaml(out.profile_yaml);
+    $("error").textContent = out.conflict ? `${out.plan.unit} is already running a plan; stop it before starting another.` : "";
+    $("start").disabled = !!out.conflict || !!state.job;
+  } catch (err) {
+    $("error").textContent = err.message;
+    $("start").disabled = true;
+  }
+}
+function showYaml(text) {
+  const old = state.yaml.split("\n");
+  const pre = $("yaml");
+  pre.textContent = "";
+  text.split("\n").forEach((line, i) => {
+    const span = document.createElement("span");
+    span.textContent = line + "\n";
+    if (state.yaml && old[i] !== line) {
+      span.className = "chg";
+      setTimeout(() => (span.className = ""), 50);
+    }
+    pre.appendChild(span);
+  });
+  state.yaml = text;
+}
+
+// ------------------------------------------------------------ charts (target line vs measured)
+
+function timeWindow() {
+  const now = Date.now() / 1000;
+  const p = state.running;
+  if (p && p.started_at) {
+    const start = Date.parse(p.started_at) / 1000;
+    return { t0: start - 60, t1: start + p.duration_h * 3600 + 60, start, end: start + p.duration_h * 3600, now };
+  }
+  const dur = state.draft.minutes * 60;
+  return { t0: now - Math.max(120, dur * 0.25), t1: now + dur * 1.05, start: now, end: now + dur, now };
+}
+function target(metric) {
+  const p = state.running;
+  if (metric === "temperature") return p ? p.temperature_c : state.draft.temperature_c;
+  return p ? p.rpm : state.draft.rpm;
+}
+function offTarget(metric, v, t, w) {
+  const tgt = target(metric);
+  if (tgt == null || t < w.start || t > w.end) return false;
+  if (metric === "temperature") return t - w.start > TOL.warmup_s && Math.abs(v - tgt) > TOL.temperature_c;
+  return t - w.start > TOL.spinup_s && Math.abs(v - tgt) > tgt * TOL.rpm_frac;
+}
+function el(name, attrs, parent) {
+  const n = document.createElementNS(SVGNS, name);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+function drawChart(svg, metric, unitLabel) {
+  const W = svg.clientWidth || 600, H = 150, L = 40, R = 8, T = 8, B = 20;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.textContent = "";
+  const w = timeWindow();
+  const s = state.series[metric] || { t: [], values: [] };
+  const pts = s.t.map((t, i) => [t, s.values[i]]).filter(([t]) => t >= w.t0 && t <= w.t1);
+  const tgt = target(metric);
+  const vals = pts.map((p) => p[1]).concat(tgt == null ? [] : [tgt]);
+  // Fixed axes (widened only if data falls outside), so dragging a number visibly moves the target line.
+  const pad = metric === "temperature" ? 1 : 20;
+  let lo = Math.min(metric === "temperature" ? 20 : 0, ...vals) - pad;
+  let hi = Math.max(metric === "temperature" ? 45 : 1000, ...vals) + pad;
+  const x = (t) => L + ((t - w.t0) / (w.t1 - w.t0)) * (W - L - R);
+  const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+  const css = (v) => `var(${v})`;
+
+  // axes: three value ticks, start/end labels
+  [lo + pad, (lo + hi) / 2, hi - pad].forEach((v) => {
+    el("line", { x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: css("--line") }, svg);
+    const tx = el("text", { x: L - 6, y: y(v) + 4, "text-anchor": "end", "font-size": 11, fill: css("--muted") }, svg);
+    tx.textContent = metric === "temperature" ? v.toFixed(1) : Math.round(v);
+  });
+  [[w.start, "start"], [w.end, "end"]].forEach(([t, label]) => {
+    const tx = el("text", { x: x(t), y: H - 4, "text-anchor": "middle", "font-size": 11, fill: css("--muted") }, svg);
+    tx.textContent = label;
+  });
+
+  // off-target shading under the measured line
+  pts.forEach(([t, v], i) => {
+    if (!offTarget(metric, v, t, w)) return;
+    const nextT = i + 1 < pts.length ? pts[i + 1][0] : t + 10;
+    el("rect", { x: x(t), y: T, width: Math.max(2, x(nextT) - x(t)), height: H - T - B, fill: css("--bad-soft") }, svg);
+  });
+
+  // target line: off before start, the setpoint during the plan, off after the end
+  if (tgt != null) {
+    el("polyline", {
+      points: `${x(w.start)},${y(tgt)} ${x(w.end)},${y(tgt)}`, fill: "none",
+      stroke: css("--ghost"), "stroke-width": 2, "stroke-dasharray": "6 5",
+    }, svg);
+    [w.start, w.end].forEach((t) => el("line", { x1: x(t), x2: x(t), y1: T, y2: H - B, stroke: css("--ghost"), "stroke-opacity": .35 }, svg));
+  }
+
+  // measured
+  if (pts.length > 1) {
+    el("polyline", { points: pts.map(([t, v]) => `${x(t)},${y(v)}`).join(" "), fill: "none",
+                     stroke: css("--actual"), "stroke-width": 1.8, "stroke-linejoin": "round" }, svg);
+  }
+
+  // now
+  if (w.now >= w.t0 && w.now <= w.t1) {
+    el("line", { x1: x(w.now), x2: x(w.now), y1: T, y2: H - B, stroke: css("--muted"), "stroke-dasharray": "2 3" }, svg);
+  }
+  const last = pts[pts.length - 1];
+  return last ? `${metric === "temperature" ? last[1].toFixed(1) : Math.round(last[1])} ${unitLabel} now` : "no readings yet";
+}
+
+// ------------------------------------------------------------ data refresh
+
+async function refreshPlan() {
+  const unit = $("unit").value;
+  if (!unit) return;
+  try {
+    const out = await api("GET", "/api/plan?unit=" + encodeURIComponent(unit));
+    const p = out.plan;
+    state.running = p && p.status === "running" ? p : null;
+  } catch (err) { state.running = null; }
+  const box = $("running");
+  if (state.running) {
+    const p = state.running;
+    const left = Math.max(0, (Date.parse(p.started_at) / 1000 + p.duration_h * 3600 - Date.now() / 1000) / 60);
+    box.textContent = `Running on ${p.unit}: ${p.summary}. ${left.toFixed(1)} min left. The chart shows this plan; the sentence is a draft for the next one.`;
+    box.hidden = false;
+  } else {
+    box.hidden = true;
+  }
+}
+async function refreshSeries() {
+  const unit = $("unit").value;
+  if (!unit) return;
+  const w = timeWindow();
+  const minutes = Math.min(1440, Math.max(5, (Math.min(w.now, w.t1) - w.t0) / 60 + 1));
+  for (const metric of ["temperature", "stirring"]) {
+    try {
+      state.series[metric] = await api("GET", `/api/series?metric=${metric}&unit=${encodeURIComponent(unit)}&minutes=${minutes.toFixed(1)}&points=200`);
+    } catch (err) { state.series[metric] = null; }
+  }
+}
+function render() {
+  document.querySelectorAll(".num").forEach((n) => (n.textContent = showValue(n.dataset.key)));
+  $("tempNow").textContent = drawChart($("chartTemp"), "temperature", "°C");
+  $("rpmNow").textContent = drawChart($("chartRpm"), "stirring", "rpm");
+}
+async function loadUnits() {
+  let units = [];
+  try { units = (await api("GET", "/api/units")).units.map((u) => u.unit); } catch (err) { /* none */ }
+  const sel = $("unit");
+  units.sort().forEach((u) => sel.appendChild(new Option(u, u)));
+  if (!units.length) sel.appendChild(new Option("default unit", ""));
+}
+
+// ------------------------------------------------------------ start, through the approval gate
+
+$("start").addEventListener("click", async () => {
+  $("error").textContent = "";
+  try {
+    const out = await api("POST", "/api/plan/start", draftBody());
+    state.job = out.job_id;
+    $("start").disabled = true;
+    pollJob();
+  } catch (err) { $("error").textContent = err.message; }
+});
+async function pollJob() {
+  if (!state.job) return;
+  let job;
+  try { job = await api("GET", "/api/jobs/" + state.job); } catch (err) { $("error").textContent = err.message; return; }
+  const a = job.approval && typeof job.approval === "object" ? job.approval : null;
+  $("approval").hidden = !a;
+  state.approvalId = a ? a.id : null;
+  if (a) {
+    const args = a.args;
+    $("approvalText").textContent = `Start "${args.name}" on ${args.unit || "the default unit"}: ${args.temperature_c} °C, ${args.rpm} rpm for ${+(args.duration_h * 60).toFixed(1)} min.`;
+  }
+  if (job.state === "running") { setTimeout(pollJob, 800); return; }
+  state.job = null;
+  $("approval").hidden = true;
+  $("error").textContent = job.answer;
+  await refreshPlan(); await refreshSeries(); render(); preview();
+}
+async function decide(decision) {
+  if (!state.approvalId) return;
+  try { await api("POST", "/api/approvals/" + state.approvalId, { decision, by: "plan-page" }); }
+  catch (err) { $("error").textContent = err.message; }
+}
+$("approve").addEventListener("click", () => decide("approve"));
+$("deny").addEventListener("click", () => decide("deny"));
+$("name").addEventListener("input", schedulePreview);
+$("unit").addEventListener("change", async () => { await refreshPlan(); await refreshSeries(); render(); preview(); });
+window.addEventListener("resize", render);
+
+(async function init() {
+  await loadUnits();
+  await refreshPlan();
+  if (state.running) {  // start the draft from what is running, so a drag is a change to it
+    state.draft = { temperature_c: state.running.temperature_c ?? 30, rpm: state.running.rpm ?? 300,
+                    minutes: Math.round(state.running.duration_h * 60) };
+  }
+  render();
+  await preview();
+  await refreshSeries();
+  render();
+  setInterval(async () => { await refreshPlan(); await refreshSeries(); render(); }, 5000);
+})();
+</script>
+</body>
+</html>

@@ -4,6 +4,7 @@ Every request needs the shared token, as `?k=<token>` or an `X-Larre-Token` head
 
     GET  /                      dashboard page (open /?k=<token> on the 3DS browser or a phone)
     GET  /plan                  plan editor: drag the numbers, see the profile and the ghost line
+    GET  /api/units             every unit LARR-E knows (configured leaders and streaming units)
     GET  /api/plan?unit=pio01   the saved plan for a unit (or all units)
     POST /api/plan/preview      {"name", "duration_h", "temperature_c", "rpm", "unit"} -> plan + YAML + limits
     POST /api/plan/start        same body; waits for approval, no LLM -> {"job_id": ...}
@@ -373,13 +374,15 @@ class LarreService:
             raise ValueError(f"metric must be one of {sorted(METRIC_TABLES)}")
         unit = self.tools.resolve_unit(unit)
         s, anchor = self.tools.get_series(metric, unit, minutes)
-        values = s.values
+        values, times = s.values, [t.timestamp() for t in s.timestamps]
         if len(values) > points:  # bucket averages keep the shape without sending every point
             size = len(values) / points  # > 1, so every bucket is non-empty
-            buckets = [values[int(i * size): int((i + 1) * size)] for i in range(points)]
-            values = [sum(b) / len(b) for b in buckets]
+            spans = [(int(i * size), int((i + 1) * size)) for i in range(points)]
+            values = [sum(values[a:b]) / (b - a) for a, b in spans]
+            times = [sum(times[a:b]) / (b - a) for a, b in spans] if times else []
         return {"unit": unit, "metric": metric, "minutes": minutes, "window_end": anchor,
-                "values": [round(v, 4) for v in values], "summary": s.summary()}
+                "values": [round(v, 4) for v in values], "t": [round(t, 1) for t in times],
+                "summary": s.summary()}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -447,6 +450,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, DASHBOARD_PATH.read_bytes(), "text/html; charset=utf-8")
             elif method == "GET" and parts == ["plan"]:
                 self._send(200, PLAN_PAGE_PATH.read_bytes(), "text/html; charset=utf-8")
+            elif method == "GET" and parts == ["api", "units"]:
+                self._json(200, svc.tools.list_units())
             elif method == "GET" and parts == ["api", "plan"]:
                 self._json(200, svc.tools.get_experiment_plan(q("unit")))
             elif method == "POST" and parts == ["api", "plan", "preview"]:

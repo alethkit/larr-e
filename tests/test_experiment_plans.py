@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import sys
 import threading
 from datetime import datetime, timedelta, timezone
@@ -220,6 +221,31 @@ def test_rest_transport_for_single_jobs(tmp_path, leader):
     path, payload = leader.posts()[0]
     assert path == "/api/workers/pio1/jobs/run/job_name/stirring/experiments/demo"
     assert payload["options"] == {"target_rpm": 400}
+
+
+def test_rest_is_the_default_start_transport():
+    if os.environ.get("LARRE_PUMP_TRANSPORT"):
+        pytest.skip("LARRE_PUMP_TRANSPORT is set in this shell")
+    assert Settings().pioreactor.pump_transport == "rest"
+
+
+def test_mqtt_start_transport_is_refused(tmp_path, leader, monkeypatch):
+    # Pioreactor 26.11 has no subscriber for pioreactor/<unit>/<exp>/run/<job>. On pio01
+    # (17 Oct 2026) a publish there started nothing, yet the tool reported ok. It must refuse instead.
+    tools = PioreactorTools(make_settings(tmp_path, leader.url, transport="mqtt"))
+    published = []
+
+    def fake_publish(topic, payload, qos=2):
+        published.append(topic)
+        return {"topic": topic, "payload": payload, "dry_run": False}
+
+    monkeypatch.setattr(tools, "_publish", fake_publish)
+    with pytest.raises(ToolError, match="mqtt"):
+        tools.start_job("stirring", options={"target_rpm": 400})
+    with pytest.raises(ToolError, match="mqtt"):
+        tools.dose("media", ml=0.5)
+    assert published == []
+    assert leader.requests == []
 
 
 def test_dry_run_touches_nothing(tmp_path, leader):

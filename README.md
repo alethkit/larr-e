@@ -51,7 +51,7 @@ LARR-E uses the same MQTT conventions as the Pioreactor web UI. No firmware chan
 | Stirring | `pioreactor/<unit>/<exp>/stirring/measured_rpm` | `{"measured_rpm": 498, "timestamp": "…Z"}` |
 | Change a setting | `pioreactor/<unit>/<exp>/<job>/<attr>/set` | `32` |
 | Stop a job | `pioreactor/<unit>/<exp>/<job>/$state/set` | `disconnected` |
-| Run a pump/job | `pioreactor/<unit>/<exp>/run/add_media` | `{"options": {"ml": 1.0}, "args": []}` |
+| Run a pump/job | REST, not MQTT: `POST /api/workers/<unit>/jobs/run/job_name/add_media/experiments/<exp>` | `{"options": {"ml": 1.0}, "args": []}` |
 | LARR-E alerts | `larre/alerts/<unit>` | alert JSON (kept outside `pioreactor/` so it is never stored) |
 | LARR-E triage | `larre/triage/<unit>` | `{"alert_id": "…", "unit": "…", "note": "…"}` |
 
@@ -60,13 +60,12 @@ History comes from the leader's SQLite database
 `growth_rates`, `stirring_rates`, `dosing_events`, `experiments`. It is opened read-only, and an
 SQLite authorizer rejects any statement that is not a read.
 
-> **Check against your Pioreactor software version.** Changing a setting (`…/set`) and stopping a
-> job (`$state/set`) over MQTT are stable. *Starting* a job is not: current Pioreactor releases
-> (checked against the 26.11 source) have no subscriber for `pioreactor/<unit>/<exp>/run/<job>`, so
-> the default `mqtt` transport is likely a silent no-op there. Use `LARRE_PUMP_TRANSPORT=rest`,
-> which calls the leader's web API (`POST /api/workers/<unit>/jobs/run/job_name/<job>/experiments/<exp>`,
-> the same call the Pioreactor UI and MCP server make), or `pios` when running on the leader.
-> Before demo day, confirm that one `larr-e exec "pump 0.5 ml of media"` actually spins the pump.
+> **Starting jobs uses REST, not MQTT.** Changing a setting (`…/set`) and stopping a job
+> (`$state/set`) over MQTT work. Starting one over MQTT doesn't: Pioreactor 26.11 has no subscriber
+> for `pioreactor/<unit>/<exp>/run/<job>`, and on a real Pi a publish there started nothing. LARR-E
+> therefore starts jobs through the leader's web API (`LARRE_PUMP_TRANSPORT=rest`, the default:
+> `POST /api/workers/<unit>/jobs/run/job_name/<job>/experiments/<exp>`, the same call the Pioreactor
+> UI and MCP server make), or `pios` when running on the leader. Any other value is refused.
 
 ---
 
@@ -110,7 +109,7 @@ export LARRE_DB_PATH=/home/pioreactor/.pioreactor/storage/pioreactor.sqlite
 # Slack: see section 4. (LARRE_SLACK_WEBHOOK_URL is a no-bot fallback; don't set it while the bot runs, or alerts post twice.)
 export LARRE_EFFORT=low                      # snappier answers on stage (default: medium)
 export LARRE_API_TOKEN=pick-a-long-random-string   # for `larr-e api`, the 3DS bridge and dashboard
-export LARRE_PUMP_TRANSPORT=rest             # start jobs via the leader's web API (see section 1)
+export LARRE_PUMP_TRANSPORT=rest             # default; start jobs via the leader's web API (see section 1)
 export LARRE_LEADER_URL=http://pioreactor.local   # the leader's web UI address
 export LARRE_LEADER_UNIT=pioreactor          # leader's unit name; defaults to the target unit (one-Pi cluster)
 export LARRE_UPDATE_EVERY_H=2                # default spacing of Slack progress updates
@@ -332,7 +331,7 @@ Approvals from any front end are logged in `runtime/audit.jsonl`, tagged with th
 ### T-30 min pre-flight checklist
 1. `ping pioreactor.local`, then `larr-e status`: the demo unit shows live OD, temperature and RPM.
 2. Start `od_reading`, `growth_rate_calculating`, `stirring` (500 RPM) and the thermostat (30 °C) from the Pioreactor UI.
-3. `larr-e exec "pump 0.5ml of media" --yes`: **the pump must audibly run.** If not, switch to `LARRE_PUMP_TRANSPORT=rest` (or `pios` on the leader).
+3. `larr-e exec "pump 0.5ml of media" --yes`: **the pump must audibly run.** If not, check `LARRE_LEADER_URL` reaches the leader's web UI.
 4. `larr-e query "plot the last 10 minutes of OD against temperature"` renders a chart.
 5. `export LARRE_ALERT_COOLDOWN_S=20`, so you can re-trigger if a judge asks.
 6. Clear old alerts: `rm runtime/alerts.jsonl`. Leave `larr-e listen` running in pane A.

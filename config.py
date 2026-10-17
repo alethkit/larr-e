@@ -102,10 +102,10 @@ class PioreactorConfig:
     experiment: str | None = _env("LARRE_EXPERIMENT")
     # How jobs and pumps are started:
     # "rest": the leader's HTTP API, as the Pioreactor web UI and MCP server do (works from any machine).
-    # "mqtt": publish to pioreactor/<unit>/<exp>/run/<job>. Current Pioreactor releases have no
-    #         subscriber for this topic, so it is likely a silent no-op. Kept for older images.
-    # "pios": shell out to `pios run ...` (only on the leader).
-    pump_transport: str = _env("LARRE_PUMP_TRANSPORT", "mqtt")
+    # "pios": shell out to `pios run ...` (only on the leader; it calls the same API).
+    # There is no MQTT option: Pioreactor 26.11 has no subscriber for pioreactor/<unit>/<exp>/run/<job>,
+    # and on a real Pi a publish there started nothing. Anything else is refused when a job starts.
+    pump_transport: str = _env("LARRE_PUMP_TRANSPORT", "rest")
     # Leader web server (port 80 on a stock image). Used by the "rest" transport and experiment plans.
     leader_url: str = _env("LARRE_LEADER_URL", "http://pioreactor.local")
     # Leader's unit name: experiment profiles execute on the leader. In a one-Pi cluster it is the worker too.

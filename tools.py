@@ -1,11 +1,11 @@
 """Hardware and data toolset that the LLM routing layer calls.
 
-Actuators talk to the Pioreactor cluster over MQTT using the same topics the
-Pioreactor web UI uses:
+Actuators use the same interfaces as the Pioreactor web UI:
 
-* change a running job's setting:  pioreactor/<unit>/<exp>/<job>/<attr>/set
-* stop a job:                      pioreactor/<unit>/<exp>/<job>/$state/set  -> "disconnected"
-* start a job (e.g. a pump):       pioreactor/<unit>/<exp>/run/<job>  -> {"options": {...}, "args": []}
+* change a running job's setting:  MQTT pioreactor/<unit>/<exp>/<job>/<attr>/set
+* stop a job:                      MQTT pioreactor/<unit>/<exp>/<job>/$state/set  -> "disconnected"
+* start a job (e.g. a pump):       REST POST /api/workers/<unit>/jobs/run/job_name/<job>/experiments/<exp>
+                                   (Pioreactor has no MQTT subscriber for starting jobs)
 
 Reads come from the leader's SQLite database (opened read-only) and from the
 live state snapshot that listener.py keeps up to date.
@@ -205,13 +205,15 @@ class PioreactorTools:
         return self._publish(f"pioreactor/{unit}/{exp}/{job}/{attr}/set", str(value))
 
     def _run_job(self, unit: str, job: str, options: dict[str, Any]) -> dict[str, Any]:
-        if self.cfg.pioreactor.pump_transport == "pios":
+        transport = self.cfg.pioreactor.pump_transport
+        if transport == "pios":
             return self._run_job_pios(unit, job, options)
-        if self.cfg.pioreactor.pump_transport == "rest":
+        if transport == "rest":
             return self._run_job_rest(unit, job, options)
-        exp = self.resolve_experiment(unit)
-        payload = json.dumps({"options": options, "args": []})
-        return self._publish(f"pioreactor/{unit}/{exp}/run/{job}", payload)
+        raise ToolError(
+            f"LARRE_PUMP_TRANSPORT={transport!r} can't start jobs; use 'rest' (or 'pios' on the leader). "
+            "Pioreactor ignores the mqtt run/<job> topic, so a publish there would start nothing."
+        )
 
     def _run_job_pios(self, unit: str, job: str, options: dict[str, Any]) -> dict[str, Any]:
         cmd = ["pios", "run", job, "--units", unit, "-y"]

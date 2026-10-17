@@ -1,0 +1,37 @@
+[project]
+name = "larr-e"
+version = "0.1.0"
+description = "Talk to your bioreactors: an AI agent that sets up, supervises and reports on Pioreactor experiments from Slack."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=1.15.0,<2",
+    "paho-mqtt>=2.1.0,<3",
+    "click>=8.1,<9",
+    "rich>=13.7",
+    "plotext>=5.3,<6",
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "slack_bolt>=1.20,<2",
+    "pyyaml>=6",
+]
+
+[project.scripts]
+larr-e = "agent:cli"
+
+[dependency-groups]
+dev = ["pytest>=8", "amqtt>=0.11", "msgspec>=0.18", "pyflakes>=3"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "agent", "api_server", "config", "experiment", "inject_anomaly", "leader_api",
+    "listener", "schema", "slack_bot", "tools", "twin",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

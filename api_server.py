@@ -70,6 +70,12 @@ PRESET_LIBRARY: dict[str, dict[str, str]] = {
         "mode": "query",
         "prompt": "How has OD changed over the last 30 minutes on the default unit? Is growth healthy?",
     },
+    "experiment": {
+        "label": "Experiment progress",
+        "mode": "query",
+        "prompt": "Report on the running experiment plan: elapsed and remaining time, whether temperature "
+        "and stirring match the plan, and how OD and growth rate are developing.",
+    },
     "dilute": {
         "label": "Dilute 0.5 ml",
         "mode": "exec",

@@ -36,7 +36,7 @@ from rich.panel import Panel
 
 from config import Settings, settings as default_settings
 from schema import SCHEMA
-from tools import utc_timestamp
+from tools import parse_timestamp, utc_timestamp
 
 console = Console()
 log = logging.getLogger("larre.listener")
@@ -266,11 +266,16 @@ class AnomalyDetector:
 
 
 class LiveState:
-    """Latest reading per unit/metric, flushed atomically to disk at most once a second."""
+    """Latest reading per unit/metric plus a short history, flushed atomically to disk at most
+    once a second."""
 
     def __init__(self, cfg: Settings = default_settings):
         self.path = cfg.output.state_path
         self.state: dict[str, dict[str, Any]] = {}
+        self.points, self.step = cfg.output.history_points, cfg.output.history_step_s
+        self.history: dict[tuple[str, str], deque[float]] = {}
+        self.history_t: dict[tuple[str, str], deque[float]] = {}
+        self._sampled: dict[tuple[str, str], float] = {}
         self._last_flush = 0.0
         self._lock = threading.Lock()
 
@@ -284,7 +289,18 @@ class LiveState:
                 unit.setdefault("od", {})[r.metric] = entry
             else:
                 unit[r.metric] = entry
-            if time.monotonic() - self._last_flush >= 1.0:
+            key, now = (r.unit, r.metric), time.monotonic()
+            if now - self._sampled.get(key, float("-inf")) >= self.step:
+                self._sampled[key] = now
+                self.history.setdefault(key, deque(maxlen=self.points)).append(round(r.value, 4))
+                unit.setdefault("history", {})[r.metric] = list(self.history[key])
+                try:
+                    stamp = parse_timestamp(r.timestamp).timestamp()
+                except ValueError:
+                    stamp = time.time()
+                self.history_t.setdefault(key, deque(maxlen=self.points)).append(round(stamp, 1))
+                unit.setdefault("history_t", {})[r.metric] = list(self.history_t[key])
+            if now - self._last_flush >= 1.0:
                 self._flush()
 
     def clear(self, unit: str, metric: str) -> None:

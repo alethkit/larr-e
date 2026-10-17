@@ -93,6 +93,17 @@ PRESET_LIBRARY: dict[str, dict[str, str]] = {
         "prompt": "Heat the default unit to 32 C: start the temperature automation (thermostat) with "
         "target_temperature 32. If it is already running, set its target temperature to 32 instead.",
     },
+    "pump": {
+        "label": "Pump media 2 s",
+        "mode": "exec",
+        "prompt": "Run the media pump on the default unit for 2 seconds (dose with pump=media, duration_s=2).",
+    },
+    "exchange": {
+        "label": "Swap media 2 s",
+        "mode": "exec",
+        "prompt": "Exchange media on the default unit: run the media pump for 2 seconds (dose pump=media, "
+        "duration_s=2), then the waste pump for 2 seconds (dose pump=waste, duration_s=2).",
+    },
     "stop": {
         "label": "Stop stir + heat",
         "mode": "exec",
@@ -321,7 +332,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and not parts:
                 self._send(200, DASHBOARD_PATH.read_bytes(), "text/html; charset=utf-8")
             elif method == "GET" and parts == ["api", "status"]:
-                self._json(200, svc.tools.get_live_status())
+                self._json(200, svc.tools.get_live_status(include_history=q("history") == "1"))
             elif method == "GET" and parts == ["api", "alerts"]:
                 self._json(200, svc.recent_alerts(min(int(q("n", 5)), 50)))
             elif method == "GET" and parts == ["api", "series"]:

@@ -137,6 +137,8 @@ class SafetyLimits:
 
     max_dose_ml: float = _env_float("LARRE_MAX_DOSE_ML", 5.0)
     max_dose_duration_s: float = _env_float("LARRE_MAX_DOSE_DURATION_S", 30.0)
+    # Without a pump calibration the Pioreactor can't turn ml into pump time: dose by seconds only.
+    pumps_calibrated: bool = _env_bool("LARRE_PUMPS_CALIBRATED", True)
     min_temperature_c: float = _env_float("LARRE_MIN_TEMP_C", 20.0)
     max_temperature_c: float = _env_float("LARRE_MAX_TEMP_C", 45.0)
     max_stirring_rpm: float = _env_float("LARRE_MAX_RPM", 1500.0)
@@ -187,6 +189,8 @@ class LLMConfig:
     hf_model: str = _env("LARRE_HF_MODEL", "openai/gpt-oss-120b:fastest")
     hf_base_url: str = _env("LARRE_HF_BASE_URL", "https://router.huggingface.co/v1")
     hf_max_tokens: int = _env_int("LARRE_HF_MAX_TOKENS", 8192)
+    # Bill a Hugging Face organization (e.g. a hackathon org holding the credits) instead of yourself.
+    hf_bill_to: str | None = _env("LARRE_HF_BILL_TO")
     # Gemini backend (OpenAI-compatible endpoint). Check your free-tier models at aistudio.google.com/rate-limit.
     gemini_model: str = _env("LARRE_GEMINI_MODEL", "gemini-3.8-flash")
     gemini_base_url: str = _env("LARRE_GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
@@ -199,6 +203,10 @@ class OutputConfig:
     runtime_dir: Path = RUNTIME_DIR
     state_path: Path = RUNTIME_DIR / "live_state.json"
     alerts_path: Path = RUNTIME_DIR / "alerts.jsonl"
+    # Recent readings kept per unit/metric in the live state (for the 3DS charts): at most
+    # history_points samples, at least history_step_s apart.
+    history_points: int = _env_int("LARRE_HISTORY_POINTS", 40)
+    history_step_s: float = _env_float("LARRE_HISTORY_STEP_S", 5.0)
     audit_path: Path = RUNTIME_DIR / "audit.jsonl"  # who requested and who approved each hardware action
     plans_path: Path = RUNTIME_DIR / "experiment_plans.json"  # the active plan per unit
     plots_dir: Path = RUNTIME_DIR / "plots"
@@ -242,7 +250,7 @@ class ApiConfig:
     workers: int = _env_int("LARRE_API_WORKERS", 4)
     max_jobs: int = _env_int("LARRE_API_MAX_JOBS", 100)
     # Which preset requests the 3DS / dashboard show, in order (the 3DS shows the first four).
-    # Available: summary, triage, trend, dilute, stir, heat, stop.
+    # Available: summary, triage, trend, dilute, stir, heat, pump, exchange, stop.
     presets: str = _env("LARRE_PRESETS", "summary,triage,trend,dilute")
 
 

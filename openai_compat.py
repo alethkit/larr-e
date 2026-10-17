@@ -21,6 +21,8 @@ from typing import Any
 from config import LLMConfig
 
 RETRYABLE = {408, 429, 500, 502, 503, 504}
+# Hugging Face's edge firewall answers Python's default "Python-urllib" User-Agent with an HTML 403.
+USER_AGENT = "larr-e/0.1 (+https://github.com/mrgarbett/larr-e)"
 
 
 class LLMError(Exception):
@@ -98,7 +100,9 @@ class ChatBackend:
         if self.llm.reasoning_effort:
             body["reasoning_effort"] = self.llm.reasoning_effort
         data = json.dumps(body).encode()
-        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json", "User-Agent": USER_AGENT}
+        if self.llm.provider == "hf" and self.llm.hf_bill_to:  # spend an organization's credits
+            headers["X-HF-Bill-To"] = self.llm.hf_bill_to
 
         for attempt in range(3):
             request = urllib.request.Request(self.url, data=data, headers=headers, method="POST")
@@ -113,6 +117,9 @@ class ChatBackend:
                 if exc.code in RETRYABLE and attempt < 2:
                     time.sleep(2 ** attempt * (5 if exc.code == 429 else 1))  # free tiers: back off harder
                     continue
+                if exc.code in (401, 403) and detail.lstrip().startswith("<"):
+                    raise LLMError(f"{p.name}'s web firewall blocked the request (HTTP {exc.code} HTML page), "
+                                   "not an API-key problem. Check the network or VPN.") from exc
                 if exc.code in (401, 403):
                     raise LLMError(f"{p.name} rejected the API key. {p.token_help}") from exc
                 if exc.code == 402:

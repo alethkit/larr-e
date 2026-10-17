@@ -2,8 +2,8 @@
  * The provider kills a request after 9 s, so every call here is short: agent questions
  * start a job and the 3DS polls it. */
 import {
-  ANSWER_LINES, BOTTOM_COLS, DEFAULT_PRESETS, MAX_UNITS, SPARK_BARS, SPARK_HEIGHT, TOP_COLS,
-  type AlertInfo, type ApprovalInfo, type JobState, type Preset, type Snapshot, type UnitRow,
+  ANSWER_LINES, BOTTOM_COLS, CHART_BARS, CHART_LABEL_CHARS, DEFAULT_PRESETS, MAX_PRESETS, MAX_UNITS, SPARK_HEIGHT, TOP_COLS,
+  type AlertInfo, type ApprovalInfo, type ChartInfo, type JobState, type Preset, type Snapshot, type UnitRow,
 } from "../shared/protocol.ts";
 import { encode, shape, toAscii } from "./format.ts";
 
@@ -19,10 +19,11 @@ const TOOL_TITLES: Record<string, string> = {
   stop_experiment: "Stop experiment",
 };
 const ALERT_MAX_AGE_S = 600;
-const SPARK_TTL_MS = 15_000;
 
 type Entry = { value: number } | undefined;
-type ApiUnit = { od?: Record<string, Entry>; temperature?: Entry; growth_rate?: Entry; stirring?: Entry };
+type ApiUnit = { od?: Record<string, Entry>; temperature?: Entry; growth_rate?: Entry; stirring?: Entry;
+  history?: Record<string, number[]>; seconds_since_last_reading?: number };
+const STALE_AFTER_S = 120;
 
 export class LarreApi {
   constructor(private cfg: BridgeConfig) {}
@@ -48,56 +49,67 @@ export function unitRow(name: string, u: ApiUnit): UnitRow {
   const alarm = (t !== undefined && (t < 22 || t > 42)) || (g !== undefined && g < -0.1);
   const text = `${name.slice(0, 9).padEnd(9)} OD ${num(od, 3).padStart(5)}  ${num(u.temperature, 1).padStart(4)}C  ` +
     `${num(u.growth_rate, 2).padStart(5)}/h  ${num(u.stirring, 0).padStart(4)}rpm`;
-  return { text: toAscii(text).slice(0, TOP_COLS), alarm };
+  const stale = (u.seconds_since_last_reading ?? 0) > STALE_AFTER_S;
+  return { text: toAscii(stale ? `${text} old` : text).slice(0, TOP_COLS), alarm };
 }
 
-/** Scale values to bar heights, resampled to exactly SPARK_BARS. */
-export function sparkBars(values: number[]): number[] {
+/** Scale values to exactly `count` bar heights in 2..SPARK_HEIGHT. Longer series are bucket-averaged;
+ * shorter ones are right-aligned (newest on the right) with empty 0-height slots on the left.
+ * A flat series sits at mid-height so a steady 500 RPM doesn't look like zero. */
+export function sparkBars(values: number[], count = CHART_BARS): number[] {
   if (!values.length) return [];
-  const lo = Math.min(...values), hi = Math.max(...values), span = hi - lo || 1;
-  return Array.from({ length: SPARK_BARS }, (_, i) => {
-    const v = values[Math.min(values.length - 1, Math.floor((i * values.length) / SPARK_BARS))];
-    return Math.round(2 + ((SPARK_HEIGHT - 2) * (v - lo)) / span);
-  });
+  let series = values;
+  if (values.length > count) {
+    const size = values.length / count;
+    series = Array.from({ length: count }, (_, i) => {
+      const bucket = values.slice(Math.floor(i * size), Math.floor((i + 1) * size));
+      return bucket.reduce((a, b) => a + b, 0) / bucket.length;
+    });
+  }
+  const lo = Math.min(...series), hi = Math.max(...series), span = hi - lo;
+  const heights = series.map(v => span < 1e-9 ? Math.round(SPARK_HEIGHT / 2) : Math.round(2 + ((SPARK_HEIGHT - 2) * (v - lo)) / span));
+  return [...Array(count - heights.length).fill(0), ...heights];
+}
+
+/** Chart for one metric of one unit, e.g. "Temp 31.8C (29.9-32.0)"; the unit name is in the rows above. */
+export function chartFor(title: string, unit: string | undefined, values: number[], suffix: string, digits: number): ChartInfo {
+  if (!unit || !values.length) return { label: toAscii(`${title}: no readings yet`), bars: [] };
+  const last = values[values.length - 1], lo = Math.min(...values), hi = Math.max(...values);
+  const label = `${title} ${last.toFixed(digits)}${suffix} (${lo.toFixed(digits)}-${hi.toFixed(digits)})`;
+  return { label: toAscii(label).slice(0, CHART_LABEL_CHARS), bars: sparkBars(values) };
 }
 
 export function createMethods(cfg: BridgeConfig) {
   const api = new LarreApi(cfg);
-  let spark: { at: number; bars: number[]; label: string } | undefined;
   let presets: Preset[] | undefined;
-
-  async function loadSpark() {
-    if (spark && Date.now() - spark.at < SPARK_TTL_MS) return spark;
-    try {
-      const s = await api.call<{ unit: string; values: number[] }>("GET", "/api/series?metric=od&minutes=30&points=40");
-      const lo = s.values.length ? Math.min(...s.values) : 0, hi = s.values.length ? Math.max(...s.values) : 0;
-      spark = { at: Date.now(), bars: sparkBars(s.values),
-        label: toAscii(`OD ${s.unit}, last 30 min: ${lo.toFixed(3)} - ${hi.toFixed(3)}`) };
-    } catch (error) { // no default unit or no data yet: keep the dashboard alive
-      spark = { at: Date.now(), bars: [], label: toAscii(`OD: ${(error as Error).message}`).slice(0, TOP_COLS) };
-    }
-    return spark;
-  }
 
   async function loadPresets() {
     if (presets) return presets;
     const data = await api.call<{ presets: { name: string; label: string; mode: string }[] }>("GET", "/api/presets");
-    presets = data.presets.slice(0, 4).map(p => ({ name: p.name, label: toAscii(p.label).slice(0, 20), exec: p.mode === "exec" }));
+    presets = data.presets.slice(0, MAX_PRESETS).map(p => ({ name: p.name, label: toAscii(p.label).slice(0, 20), exec: p.mode === "exec" }));
     return presets;
   }
 
   async function snapshot(): Promise<Snapshot> {
-    const [status, alerts, approvals, sparkData, presetList] = await Promise.all([
-      api.call<{ available: boolean; note?: string } & Record<string, unknown>>("GET", "/api/status"),
+    const [status, alerts, approvals, presetList] = await Promise.all([
+      api.call<{ available: boolean; note?: string } & Record<string, unknown>>("GET", "/api/status?history=1"),
       api.call<{ alerts: { severity: string; unit: string; metric: string; message: string; age_s: number | null }[] }>("GET", "/api/alerts?n=1"),
       api.call<{ approvals: { id: string; tool: string; args: Record<string, unknown> }[] }>("GET", "/api/approvals"),
-      loadSpark(),
       loadPresets().catch(() => DEFAULT_PRESETS),
     ]);
     const { available, note, ...units } = status;
-    const rows = available
-      ? Object.keys(units).sort().slice(0, MAX_UNITS).map(name => unitRow(name, units[name] as ApiUnit))
-      : [];
+    const names = available ? Object.keys(units).sort() : [];
+    const rows = names.slice(0, MAX_UNITS).map(name => unitRow(name, units[name] as ApiUnit));
+    // Chart the first unit that has history for each metric.
+    const historyOf = (metric: string) => {
+      const name = names.find(n => ((units[n] as ApiUnit).history?.[metric]?.length ?? 0) > 0);
+      return { name, values: name ? (units[name] as ApiUnit).history![metric] : [] };
+    };
+    const temp = historyOf("temperature"), stir = historyOf("stirring");
+    const charts: [ChartInfo, ChartInfo] = [
+      chartFor("Temp", temp.name, temp.values, "C", 1),
+      chartFor("Stir", stir.name, stir.values, "rpm", 0),
+    ];
     const last = alerts.alerts.at(-1);
     const alert: AlertInfo | null = last && last.age_s !== null && last.age_s <= ALERT_MAX_AGE_S
       ? { title: toAscii(`${last.severity.toUpperCase()}  ${last.unit}  ${last.metric}`), critical: last.severity === "critical",
@@ -112,7 +124,7 @@ export function createMethods(cfg: BridgeConfig) {
     return {
       units: rows,
       note: available ? "" : toAscii(note ?? "No telemetry yet").slice(0, TOP_COLS),
-      alert, approval, spark: sparkData.bars, sparkLabel: sparkData.label, presets: presetList,
+      alert, approval, charts, presets: presetList,
     };
   }
 

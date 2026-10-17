@@ -633,8 +633,33 @@ class PioreactorTools:
         except (FileNotFoundError, json.JSONDecodeError):
             return {}
 
+    def _with_ages(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Add age_s and stale to every reading, so an old value can't pass for a live one."""
+        now = datetime.now(timezone.utc)
+        limit = self.cfg.output.stale_after_s
+
+        def mark(entry: dict[str, Any]) -> None:
+            try:
+                age = (now - parse_timestamp(entry["timestamp"])).total_seconds()
+            except (KeyError, TypeError, ValueError):
+                entry["stale"] = True
+                return
+            entry["age_s"] = round(age)
+            entry["stale"] = age > limit
+
+        for unit_state in state.values():
+            if not isinstance(unit_state, dict):
+                continue
+            for key, entry in unit_state.items():
+                if key == "od" and isinstance(entry, dict):
+                    for channel in entry.values():
+                        mark(channel)
+                elif isinstance(entry, dict) and "timestamp" in entry:
+                    mark(entry)
+        return state
+
     def get_live_status(self, unit: str | None = None) -> dict[str, Any]:
-        state = self._live_state()
+        state = self._with_ages(self._live_state())
         if not state:
             return {"available": False, "note": "listener.py is not running or has seen no telemetry yet."}
         if unit:

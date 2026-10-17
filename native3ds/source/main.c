@@ -107,9 +107,9 @@ static bool decide_approve;
 static volatile bool link_quit;
 static LightEvent link_wake;
 
-static bool load_cfg(void)
+static bool load_cfg_from(const char *path)
 {
-	FILE *f = fopen(LARRE_CFG_PATH, "r");
+	FILE *f = fopen(path, "r");
 	if (!f)
 		return false;
 	char text[512];
@@ -117,6 +117,19 @@ static bool load_cfg(void)
 	fclose(f);
 	text[n] = '\0';
 	return cfg_parse(text, &cfg) == 0;
+}
+
+// The SD card's file wins, so a bundled build can be pointed elsewhere without rebuilding.
+static bool load_cfg(void)
+{
+	if (load_cfg_from(LARRE_CFG_PATH))
+		return true;
+	bool ok = false;
+	if (R_SUCCEEDED(romfsInit())) {
+		ok = load_cfg_from(LARRE_CFG_BUNDLED);
+		romfsExit();
+	}
+	return ok;
 }
 
 // One HTTP request. Fills *status with the HTTP status code and, when out is

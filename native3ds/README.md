@@ -23,6 +23,10 @@ url=http://192.168.43.10:8787
 token=<the same LARRE_API_TOKEN as larr-e api>
 ```
 
+To bundle the settings into the app instead, put the same two lines in `romfs/larre.cfg`
+(gitignored, since it holds the token) and run `make clean && make`. A file on the SD card
+still wins over the bundled one.
+
 `url` is the computer running `larr-e api`, on the same network as the 3DS. Plain `http://`
 only. The app polls `GET /api/screen` every 2 s (a plain-text view made for this 40-column
 screen; see `api_server.screen_lines`) and sends decisions to `POST /api/approvals/<id>`. The

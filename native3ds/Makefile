@@ -38,7 +38,8 @@ DATA		:=	data
 INCLUDES	:=	include
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
-#ROMFS		:=	romfs
+# romfs/larre.cfg (gitignored) is bundled into the .3dsx when present; see README.
+ROMFS		:=	$(if $(wildcard $(TOPDIR)/romfs/larre.cfg),romfs,)
 #GFXBUILD	:=	$(ROMFS)/gfx
 APP_TITLE	:=	LARR-E Cam
 APP_DESCRIPTION	:=	Watch a bioreactor vial with the 3DS camera

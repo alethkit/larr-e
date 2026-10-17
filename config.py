@@ -74,6 +74,8 @@ class MQTTConfig:
     # Where LARR-E publishes its own alerts, outside the pioreactor/ namespace
     # so the leader's mqtt_to_db_streaming job never stores them.
     alert_topic_prefix: str = "larre/alerts"
+    # How long the broker (on the Pi) may be unreachable before "lost contact" is announced.
+    link_grace_s: float = _env_float("LARRE_LINK_GRACE_S", 20.0)
     triage_topic_prefix: str = "larre/triage"
 
 

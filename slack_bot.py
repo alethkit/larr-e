@@ -35,6 +35,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError
 
 from agent import LarreAgent
+from openai_compat import LLMError
 from config import Settings, settings as default_settings
 from listener import build_client
 from tools import PioreactorTools, ToolError, utc_timestamp
@@ -192,6 +193,8 @@ class LarreBot:
                 answer = f":warning: Claude API error {exc.status_code}: {exc.message}"
             except anthropic.APIConnectionError:
                 answer = ":warning: Cannot reach the Claude API right now."
+            except LLMError as exc:
+                answer = f":warning: {exc}"
             footer = f"\n_tools: {' '.join(conv.tool_log)}_" if conv.tool_log else ""
             self.client.chat_update(channel=channel, ts=conv.status_ts, text=answer + footer)
 

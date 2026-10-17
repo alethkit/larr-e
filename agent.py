@@ -22,6 +22,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from config import Settings, settings as default_settings
+from openai_compat import ChatBackend, LLMError, to_openai_tools
 from tools import METRIC_TABLES, PUMP_JOBS, STARTABLE_JOBS, STOPPABLE_JOBS, PioreactorTools, ToolError
 
 console = Console()
@@ -65,6 +66,7 @@ Rules:
   get around it, e.g. by splitting one large dose into several small ones.
 - If a request is ambiguous in a way that matters for hardware (which unit, how much), ask instead of guessing.
 - If the user declines a confirmation, stop and say nothing was changed.
+- Never state a reading you have not fetched with a tool in this conversation.
 - Reply in a few short lines suitable for a terminal or Slack message: what you did or found, with numbers.
 """
 
@@ -223,7 +225,14 @@ ACTION_TOOLS = [
         {
             "job": {"type": "string", "enum": sorted(STARTABLE_JOBS)},
             "unit": UNIT,
-            "options": {"type": "object"},
+            "options": {
+                "type": "object",
+                "properties": {
+                    "target_rpm": {"type": "number", "description": "stirring only"},
+                    "automation_name": {"type": "string", "enum": ["thermostat"], "description": "temperature_automation only"},
+                    "target_temperature": {"type": "number", "description": "temperature_automation only, in C"},
+                },
+            },
         },
         ["job"],
     ),
@@ -243,7 +252,11 @@ ToolResultFn = Callable[[str, dict[str, Any], dict[str, Any], bool], None]
 
 
 class LarreAgent:
-    """Manual tool-use loop so every hardware call passes through our confirmation gate."""
+    """Manual tool-use loop so every hardware call passes through our confirmation gate.
+
+    Two LLM backends share the tools, limits and gates: Claude (default) and open models
+    through Hugging Face Inference Providers or Google Gemini (LARRE_LLM=hf | gemini), both via
+    their OpenAI-compatible chat APIs."""
 
     def __init__(
         self,
@@ -267,7 +280,13 @@ class LarreAgent:
         self.verbose = verbose
         self.on_tool_result = on_tool_result
         self.requester = ""  # set by front ends so plans record who asked
-        self.client = anthropic.Anthropic()
+        self.provider = cfg.llm.provider
+        if self.provider == "anthropic":
+            self.client = anthropic.Anthropic()
+        elif self.provider in ("hf", "gemini"):
+            self.chat = ChatBackend(cfg.llm)
+        else:
+            raise ValueError(f"LARRE_LLM must be 'anthropic', 'hf' or 'gemini', not {self.provider!r}")
         self.messages: list[dict[str, Any]] = []
         self.tool_specs = READ_TOOLS + (ACTION_TOOLS if mode == "exec" else [])
         self.system = SYSTEM_PROMPT + ("" if mode == "exec" else "\n" + QUERY_MODE_NOTE)
@@ -278,7 +297,14 @@ class LarreAgent:
 
     def _dispatch(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         t = self.tools
-        if "unit" in {p for spec in self.tool_specs if spec["name"] == name for p in spec["input_schema"]["properties"]}:
+        spec = next((s for s in self.tool_specs if s["name"] == name), None)
+        if spec is None:
+            raise ToolError(f"Tool {name} is not available in {self.mode} mode.")
+        # Claude enforces the schema; open models may not, so reject anything outside it.
+        unknown = set(args) - set(spec["input_schema"]["properties"])
+        if unknown:
+            raise ToolError(f"Unknown argument(s) for {name}: {sorted(unknown)}")
+        if "unit" in spec["input_schema"]["properties"]:
             args.setdefault("unit", self.default_unit)
         handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "get_live_status": t.get_live_status,
@@ -301,16 +327,17 @@ class LarreAgent:
             raise ToolError(f"Tool {name} is not available in {self.mode} mode.")
         if name == "start_experiment" and self.requester:
             args.setdefault("requested_by", self.requester)
-        if name in ACTION_TOOL_NAMES and not self.confirm(name, args):
-            return {"ok": False, "declined": True, "note": "The operator declined this action. Nothing was changed."}
+        if name in ACTION_TOOL_NAMES:
+            handlers[name](**args, check_only=True)  # raises ToolError on a limit, before anyone is asked
+            if not self.confirm(name, args):
+                return {"ok": False, "declined": True, "note": "The operator declined this action. Nothing was changed."}
         return handlers[name](**args)
 
-    def _run_tool(self, block: Any) -> dict[str, Any]:
-        args = dict(block.input or {})
+    def _execute(self, name: str, args: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         if self.verbose:
-            console.print(f"[dim]→ {block.name}({json.dumps(args)})[/dim]")
+            console.print(f"[dim]→ {name}({json.dumps(args)})[/dim]")
         try:
-            result = self._dispatch(block.name, args)
+            result = self._dispatch(name, args)
             is_error = False
         except (ToolError, TypeError, ValueError) as exc:
             result = {"error": str(exc)}
@@ -319,7 +346,11 @@ class LarreAgent:
             style = "red" if is_error else "green"
             console.print(f"[{style}]  ← {json.dumps(result, default=str)[:300]}[/{style}]")
         if self.on_tool_result:
-            self.on_tool_result(block.name, args, result, is_error)
+            self.on_tool_result(name, args, result, is_error)
+        return result, is_error
+
+    def _run_tool(self, block: Any) -> dict[str, Any]:
+        result, is_error = self._execute(block.name, dict(block.input or {}))
         return {
             "type": "tool_result",
             "tool_use_id": block.id,
@@ -350,9 +381,11 @@ class LarreAgent:
             "mode": self.mode,
             "experiment_plan": self.tools.active_plan_context(self.default_unit),
         }
-        self.messages.append(
-            {"role": "user", "content": f"<context>{json.dumps(context)}</context>\n\n{prompt}"}
-        )
+        content = f"<context>{json.dumps(context)}</context>\n\n{prompt}"
+        return self._ask_claude(content) if self.provider == "anthropic" else self._ask_openai(content)
+
+    def _ask_claude(self, content: str) -> str:
+        self.messages.append({"role": "user", "content": content})
         for _ in range(self.cfg.llm.max_turns):
             response = self._create()
             # Append the full content (thinking and fallback blocks included) so the
@@ -371,6 +404,43 @@ class LarreAgent:
 
             text = "\n".join(b.text for b in response.content if b.type == "text").strip()
             if response.stop_reason == "max_tokens":
+                text += "\n\n[truncated: hit max_tokens]"
+            return text or "(no response)"
+        return f"Stopped after {self.cfg.llm.max_turns} tool rounds without a final answer."
+
+    def _ask_openai(self, content: str) -> str:
+        if not self.messages:
+            self.messages.append({"role": "system", "content": self.system})
+        self.messages.append({"role": "user", "content": content})
+        tools = to_openai_tools(self.tool_specs, self.provider)
+        for _ in range(self.cfg.llm.max_turns):
+            choice = self.chat.create(self.messages, tools)["choices"][0]
+            message = choice.get("message") or {}
+            calls = message.get("tool_calls") or []
+            entry: dict[str, Any] = {"role": "assistant", "content": message.get("content") or ""}
+            if calls:
+                # Echo the calls verbatim: Gemini 3 attaches thought signatures to them that must come back.
+                entry["tool_calls"] = calls
+            self.messages.append(entry)
+
+            if calls:
+                for call in calls:
+                    function = call.get("function") or {}
+                    name, raw = function.get("name", ""), function.get("arguments") or "{}"
+                    try:
+                        args = raw if isinstance(raw, dict) else json.loads(raw)
+                        if not isinstance(args, dict):
+                            raise ValueError("arguments must be a JSON object")
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        result: dict[str, Any] = {"error": f"Tool arguments were not valid JSON ({exc}); call {name} again with a JSON object."}
+                    else:
+                        result, _ = self._execute(name, args)
+                    self.messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "name": name,
+                                          "content": json.dumps(result, default=str)})
+                continue
+
+            text = (message.get("content") or "").strip()
+            if choice.get("finish_reason") == "length":
                 text += "\n\n[truncated: hit max_tokens]"
             return text or "(no response)"
         return f"Stopped after {self.cfg.llm.max_turns} tool rounds without a final answer."
@@ -409,6 +479,9 @@ def _handle_api_errors(fn: Callable[[], None]) -> None:
         sys.exit(3)
     except anthropic.APIStatusError as exc:
         console.print(f"[red]Anthropic API error {exc.status_code}: {exc.message}[/red]")
+        sys.exit(3)
+    except LLMError as exc:
+        console.print(f"[red]{exc}[/red]")
         sys.exit(3)
 
 

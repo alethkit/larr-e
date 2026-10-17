@@ -208,7 +208,7 @@ class PioreactorTools:
         transport = self.cfg.pioreactor.pump_transport
         if transport == "pios":
             return self._run_job_pios(unit, job, options)
-        if transport == "rest":
+        if transport in ("rest", "http"):  # "http" is the same transport under another name
             return self._run_job_rest(unit, job, options)
         raise ToolError(
             f"LARRE_PUMP_TRANSPORT={transport!r} can't start jobs; use 'rest' (or 'pios' on the leader). "
@@ -233,12 +233,20 @@ class PioreactorTools:
         if self.dry_run:
             return record
         try:
-            record["leader_response"] = self.leader_for(unit).run_job(unit, job, exp, options)
+            response = self.leader_for(unit).run_job(unit, job, exp, options)
         except LeaderAPIError as exc:
             raise ToolError(str(exc)) from exc
+        # The leader accepts the request; only the per-unit result says whether the unit did it.
+        per_unit = response if isinstance(response, dict) else {}
+        refusals = [f"{u}: {r.get('error') or r}" for u, r in per_unit.items() if isinstance(r, dict) and r.get("ok") is False]
+        if refusals:
+            raise ToolError(f"Pioreactor did not start {job}: {'; '.join(refusals)}"[:300])
+        record["leader_response"] = response
         return record
 
     # ------------------------------------------------------------------ actuators
+    # Each actuator validates against SafetyLimits first. check_only=True stops after
+    # validation, so an out-of-limit request is rejected before anyone is asked to confirm it.
 
     def dose(
         self,
@@ -246,6 +254,7 @@ class PioreactorTools:
         unit: str | None = None,
         ml: float | None = None,
         duration_s: float | None = None,
+        check_only: bool = False,
     ) -> dict[str, Any]:
         if pump not in PUMP_JOBS:
             raise ToolError(f"pump must be one of {sorted(PUMP_JOBS)}")
@@ -261,16 +270,20 @@ class PioreactorTools:
                 raise ToolError(f"duration_s must be in (0, {limits.max_dose_duration_s}] (safety limit).")
             options = {"duration": round(float(duration_s), 2)}
         unit = self.resolve_unit(unit)
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
         result = self._run_job(unit, PUMP_JOBS[pump], options)
         return {"ok": True, "action": PUMP_JOBS[pump], "unit": unit, **options, **result}
 
-    def set_target_temperature(self, celsius: float, unit: str | None = None) -> dict[str, Any]:
+    def set_target_temperature(self, celsius: float, unit: str | None = None, check_only: bool = False) -> dict[str, Any]:
         limits = self.cfg.safety
         if not limits.min_temperature_c <= celsius <= limits.max_temperature_c:
             raise ToolError(
                 f"Target must be within {limits.min_temperature_c}-{limits.max_temperature_c} °C."
             )
         unit = self.resolve_unit(unit)
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
         result = self._set_attribute(unit, "temperature_automation", "target_temperature", round(celsius, 2))
         return {
             "ok": True,
@@ -280,14 +293,18 @@ class PioreactorTools:
             **result,
         }
 
-    def set_stirring_rpm(self, rpm: float, unit: str | None = None) -> dict[str, Any]:
+    def set_stirring_rpm(self, rpm: float, unit: str | None = None, check_only: bool = False) -> dict[str, Any]:
         if not 0 <= rpm <= self.cfg.safety.max_stirring_rpm:
             raise ToolError(f"rpm must be within 0-{self.cfg.safety.max_stirring_rpm}.")
         unit = self.resolve_unit(unit)
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
         result = self._set_attribute(unit, "stirring", "target_rpm", round(rpm))
         return {"ok": True, "unit": unit, "target_rpm": round(rpm), **result}
 
-    def start_job(self, job: str, unit: str | None = None, options: dict[str, Any] | None = None) -> dict[str, Any]:
+    def start_job(
+        self, job: str, unit: str | None = None, options: dict[str, Any] | None = None, check_only: bool = False
+    ) -> dict[str, Any]:
         if job not in STARTABLE_JOBS:
             raise ToolError(f"job must be one of {sorted(STARTABLE_JOBS)}")
         options = dict(options or {})
@@ -302,13 +319,17 @@ class PioreactorTools:
             if not 0 <= float(options["target_rpm"]) <= self.cfg.safety.max_stirring_rpm:
                 raise ToolError(f"target_rpm must be within 0-{self.cfg.safety.max_stirring_rpm}.")
         unit = self.resolve_unit(unit)
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
         result = self._run_job(unit, job, options)
         return {"ok": True, "unit": unit, "job": job, "options": options, **result}
 
-    def stop_job(self, job: str, unit: str | None = None) -> dict[str, Any]:
+    def stop_job(self, job: str, unit: str | None = None, check_only: bool = False) -> dict[str, Any]:
         if job not in STOPPABLE_JOBS:
             raise ToolError(f"job must be one of {sorted(STOPPABLE_JOBS)}")
         unit = self.resolve_unit(unit)
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
         result = self._set_attribute(unit, job, "$state", "disconnected")
         return {"ok": True, "unit": unit, "job": job, "state": "disconnected", **result}
 
@@ -360,7 +381,7 @@ class PioreactorTools:
             "conflict": current.summary() if current and current.status == "running" else None,
         }
 
-    def start_experiment(self, **kwargs: Any) -> dict[str, Any]:
+    def start_experiment(self, check_only: bool = False, **kwargs: Any) -> dict[str, Any]:
         """Upload the profile to the leader and execute it. Pioreactor then owns the schedule."""
         plan = self._build_plan(**kwargs)
         current = self.plans.get(plan.unit)
@@ -369,6 +390,8 @@ class PioreactorTools:
                 f"{plan.unit} already runs '{current.summary()}'. Stop it with stop_experiment first: "
                 "two profiles driving the same jobs interfere with each other."
             )
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True, "plan": plan.public()}
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         plan.profile_filename = f"{plan.profile_name()}-{stamp}.yaml"
         yaml_body = plan.to_profile_yaml()
@@ -397,12 +420,14 @@ class PioreactorTools:
             return {"plan": plan.public() if plan else None}
         return {"plans": [p.public() for p in self.plans.all()]}
 
-    def stop_experiment(self, unit: str | None = None) -> dict[str, Any]:
+    def stop_experiment(self, unit: str | None = None, check_only: bool = False) -> dict[str, Any]:
         """Stop the running profile and the jobs it started, before its scheduled end."""
         unit = self.resolve_unit(unit)
         plan = self.plans.get(unit)
         if not plan or plan.status != "running":
             raise ToolError(f"No running experiment plan on {unit}.")
+        if check_only:  # validated; the agent asks for confirmation before the real call
+            return {"ok": True}
         stopped, errors = [], []
         if not self.dry_run:
             leader = self.leader_for(unit)

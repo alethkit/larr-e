@@ -38,6 +38,7 @@ from urllib.parse import parse_qs, urlparse
 import anthropic
 
 from agent import LarreAgent
+from openai_compat import LLMError
 from config import Settings, settings as default_settings
 from tools import METRIC_TABLES, PioreactorTools, ToolError, parse_timestamp, utc_timestamp
 
@@ -51,7 +52,7 @@ STYLES = {
     "web": "Your answer is shown on a small phone-sized web page: plain text, at most 8 short lines.",
 }
 
-PRESETS: dict[str, dict[str, str]] = {
+PRESET_LIBRARY: dict[str, dict[str, str]] = {
     "summary": {
         "label": "Health check",
         "mode": "query",
@@ -79,6 +80,23 @@ PRESETS: dict[str, dict[str, str]] = {
         "label": "Dilute 0.5 ml",
         "mode": "exec",
         "prompt": "Dilute the default unit: add 0.5 ml of fresh media, then remove 0.5 ml of waste.",
+    },
+    "stir": {
+        "label": "Start stirring",
+        "mode": "exec",
+        "prompt": "Start stirring on the default unit at 500 RPM. If stirring is already running, "
+        "set its target to 500 RPM instead.",
+    },
+    "heat": {
+        "label": "Heat to 32 C",
+        "mode": "exec",
+        "prompt": "Heat the default unit to 32 C: start the temperature automation (thermostat) with "
+        "target_temperature 32. If it is already running, set its target temperature to 32 instead.",
+    },
+    "stop": {
+        "label": "Stop stir + heat",
+        "mode": "exec",
+        "prompt": "Stop the stirring job and the temperature automation on the default unit.",
     },
 }
 
@@ -124,6 +142,11 @@ class LarreService:
         self.lock = threading.Lock()
         self.jobs: OrderedDict[str, Job] = OrderedDict()
         self.approvals: dict[str, Approval] = {}
+        names = [n.strip() for n in cfg.api.presets.split(",") if n.strip()]
+        unknown = [n for n in names if n not in PRESET_LIBRARY]
+        if unknown:
+            raise ValueError(f"Unknown LARRE_PRESETS entries {unknown}; choose from {sorted(PRESET_LIBRARY)}")
+        self.presets = {n: PRESET_LIBRARY[n] for n in names}
 
     # ---------------------------------------------------------------- jobs
 
@@ -157,6 +180,8 @@ class LarreService:
             job.answer, job.state = f"Claude API error {exc.status_code}: {exc.message}", "error"
         except anthropic.APIConnectionError:
             job.answer, job.state = "Cannot reach the Claude API.", "error"
+        except LLMError as exc:
+            job.answer, job.state = str(exc), "error"
         except Exception as exc:  # the API server must survive any job failure
             log.exception("Job %s failed", job.id)
             job.answer, job.state = f"Internal error: {exc}", "error"
@@ -304,9 +329,9 @@ class Handler(BaseHTTPRequestHandler):
                                            max(2, min(int(q("points", 40)), 200))))
             elif method == "GET" and parts == ["api", "presets"]:
                 self._json(200, {"presets": [{"name": k, "label": v["label"], "mode": v["mode"]}
-                                             for k, v in PRESETS.items()], "dry_run": svc.tools.dry_run})
+                                             for k, v in svc.presets.items()], "dry_run": svc.tools.dry_run})
             elif method == "POST" and len(parts) == 3 and parts[:2] == ["api", "presets"]:
-                preset = PRESETS.get(parts[2])
+                preset = svc.presets.get(parts[2])
                 if not preset:
                     raise LookupError(f"unknown preset {parts[2]}")
                 body = self._body()

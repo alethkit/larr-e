@@ -39,6 +39,7 @@ class FakeLeader:
         self.requests: list[tuple[str, str, object]] = []
         self.profiles: dict[str, str] = {}
         self.reject_upload: str | None = None
+        self.task_result: object = {"ran": True}
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -56,7 +57,7 @@ class FakeLeader:
             def do_GET(self):
                 outer.requests.append(("GET", self.path, None))
                 if self.path.startswith("/unit_api/task_results/"):
-                    self._reply(200, {"task_id": "t1", "status": "succeeded", "result": {"ran": True}})
+                    self._reply(200, {"task_id": "t1", "status": "succeeded", "result": outer.task_result})
                 elif self.path.endswith("/experiment_profiles/running"):
                     runs = [{"job_name": "experiment_profile", "job_id": 41, "settings": {"profile_filename": "someone-elses.yaml"}}]
                     runs += [{"job_name": "experiment_profile", "job_id": 42 + i, "settings": {"profile_filename": f}}
@@ -246,6 +247,35 @@ def test_mqtt_start_transport_is_refused(tmp_path, leader, monkeypatch):
         tools.dose("media", ml=0.5)
     assert published == []
     assert leader.requests == []
+
+
+def test_http_is_another_name_for_rest(tmp_path, leader):
+    # Upstream called the leader-API transport "http"; existing .env files may still say so.
+    tools = PioreactorTools(make_settings(tmp_path, leader.url, transport="http"))
+    tools.start_job("stirring", options={"target_rpm": 400})
+    path, payload = leader.posts()[0]
+    assert path == "/api/workers/pio1/jobs/run/job_name/stirring/experiments/demo"
+    assert payload["options"] == {"target_rpm": 400}
+
+
+def test_check_only_validates_plans_without_touching_the_leader(tmp_path, leader):
+    # The agent calls every action tool with check_only=True before asking for approval.
+    tools = PioreactorTools(make_settings(tmp_path, leader.url))
+    assert tools.start_experiment(**OVERNIGHT, check_only=True)["ok"]
+    with pytest.raises(ToolError):
+        tools.start_experiment(**{**OVERNIGHT, "temperature_c": 80}, check_only=True)
+    with pytest.raises(ToolError, match="No running experiment"):
+        tools.stop_experiment(check_only=True)  # nothing to stop: refuse before anyone is asked
+    assert leader.posts() == []  # reads (which experiment the unit is on) are fine; nothing uploaded or run
+    assert tools.get_experiment_plan()["plans"] == []
+
+
+def test_leader_reported_failure_is_a_tool_error(tmp_path, leader):
+    # The leader accepts the request (202) and only the task result says the unit refused it.
+    leader.task_result = {"pio1": {"ok": False, "error": "stirring is already running"}}
+    tools = PioreactorTools(make_settings(tmp_path, leader.url))
+    with pytest.raises(ToolError, match="already running"):
+        tools.start_job("stirring", options={"target_rpm": 400})
 
 
 def test_dry_run_touches_nothing(tmp_path, leader):

@@ -5,3 +5,5 @@ __pycache__/
 .env
 .env.*
 !.env.example
+# private raw material (design thread export, organiser PDFs): see CLAUDE.md
+/notes/

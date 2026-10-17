@@ -94,6 +94,25 @@ export LARRE_EFFORT=low                      # snappier answers on stage (defaul
 export LARRE_API_TOKEN=pick-a-long-random-string   # for `larr-e api`, the 3DS bridge and dashboard
 ```
 
+**LLM backend.** The default is Claude (`ANTHROPIC_API_KEY`). To use open models through
+[Hugging Face Inference Providers](https://huggingface.co/docs/inference-providers/en/index)
+and your HF credits instead:
+```bash
+export LARRE_LLM=hf
+export HF_TOKEN=hf_...                                 # fine-grained, "Make calls to Inference Providers"
+export LARRE_HF_MODEL=openai/gpt-oss-120b:fastest      # default; ":cheapest" or ":groq" etc. pick the provider
+```
+Or use **Google Gemini's free tier** (key from [aistudio.google.com](https://aistudio.google.com/apikey),
+no card needed; check your model limits at aistudio.google.com/rate-limit):
+```bash
+export LARRE_LLM=gemini
+export GEMINI_API_KEY=...
+export LARRE_GEMINI_MODEL=gemini-3.8-flash             # default
+```
+Tools, safety limits, confirmations and approvals behave the same on both backends. They live in
+Python, not in the model. Open models are less reliable at multi-step tool use, so rehearse with the
+backend you'll present with.
+
 Run the agent **on the leader** to get direct DB access. To run it from a laptop, copy the DB over
 first (`scp pioreactor@pioreactor.local:.pioreactor/storage/pioreactor.sqlite ./runtime/`) and point
 `LARRE_DB_PATH` at the copy.

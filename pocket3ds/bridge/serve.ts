@@ -4,11 +4,11 @@
  */
 import { connectOffloadProvider } from "@pocketjs/framework/offload/provider";
 
-const address = process.argv[2];
+const address = process.argv[2] ?? process.env.LARRE_3DS_HOST;
 const api = process.argv[3] ?? process.env.LARRE_API_URL ?? "http://127.0.0.1:8787";
 const token = process.env.LARRE_API_TOKEN;
 if (!address || !token) {
-  console.error("Usage: LARRE_API_TOKEN=<token> bun bridge/serve.ts <3ds-ip> [api-url]");
+  console.error("Usage: LARRE_API_TOKEN=<token> bun bridge/serve.ts <3ds-ip> [api-url]  (or set LARRE_3DS_HOST)");
   process.exit(1);
 }
 const key = (await Bun.file(".local/pair.key").text()).trim();

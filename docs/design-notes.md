@@ -1,22 +1,29 @@
 # Design notes: how LARR-E got here
 
 This distils the design conversation (a long ChatGPT thread, 17 Oct) and the organisers' prompting
-playbook. Decisions that stand are in `CLAUDE.md`. This file keeps the reasoning, the ideas we
-parked, and the places where the earlier advice turned out wrong or unchecked, so nobody spends time
-re-deriving them.
+playbook. Decisions that stand are in `CLAUDE.md`. This file keeps the reasoning, the extensions
+LARR-E is designed to grow into, and the places where the earlier advice turned out wrong or
+unchecked, so nobody spends time re-deriving them.
 
 ## 1. How the idea evolved
 
 1. **A Nintendo 3DS as a bioreactor control panel.** What the hardware offers: two screens (state on
    top, controls below), a stylus for *drawing* a feed-rate or stirring profile instead of typing
    setpoints, physical buttons for acknowledging alarms, a clamshell you can carry round the lab.
-   Stereoscopic 3D and the gyroscope add little. → Built later as `web/dashboard.html` and
-   `pocket3ds/`, then **deprioritised**: it is a gimmick, not the product.
+   Stereoscopic 3D and the gyroscope add little. → **Implemented**, as two front ends on the same
+   HTTP API (`api_server.py`):
+   - `web/dashboard.html`, for the 3DS browser and other small screens;
+   - `pocket3ds/`, a native PocketJS app. Live dashboard on the top screen, tap-able requests below,
+     and an approval gate on the hardware buttons (Ⓐ approve, Ⓑ deny). It talks to the API through
+     the `pocket3ds/bridge/` relay.
+
+   Its README screenshots come from the PocketJS simulator, so check it on the real handheld before
+   demo day. Drawing a profile with the stylus is not built yet: see the extensions in section 3.
 2. **The primary interface is chat** (Slack or Discord), with an agent babysitting the reactor. The
    3DS became one more front end.
 3. **Twitch, in the spirit of "Claude Plays Pokémon"**, with a real culture that can't be reset. Best
    version: the audience *predicts* the growth curve, and predictions are compared with LARR-E's and
-   the measured one. Viewers never send commands to hardware. → **Bonus only**, if time permits.
+   the measured one. Viewers never send commands to hardware. → An extension (section 3).
 4. **The scientist's actual workflow** settled the product (see `CLAUDE.md`, "What LARR-E is for").
    It moved the priority from anomaly detection to *setting up a whole experiment from one message
    and reporting on it*.
@@ -34,24 +41,44 @@ re-deriving them.
 | Long experiments vs the context window | Keep experiment memory (plan, measurements, decisions) outside the model, and treat conversation memory as disposable. An 18-hour experiment shouldn't need an 18-hour conversation. |
 | Jobs, automations, profiles: what are they, mathematically? | Job: a state machine. Automation: a feedback controller choosing actions from readings and a target. Profile: a time-indexed program of actions, with `if`, `when` and `repeat`, so a small reactive language. Restriction we chose: **one active profile per unit**. |
 
-## 3. Ideas explored and parked
+## 3. Extensions
 
-- **Datalog/Prolog.** Facts about the reactor, plus rules deciding when something needs attention,
-  plus perhaps a model of permitted actions. Then pyDatalog, then dropped: a few Python conditions
-  do the same job this weekend. It becomes worthwhile when the attention rules are numerous,
-  user-written, or need explaining. Interesting future direction: *rules decide whether to wake the
-  LLM*.
-- **Event sourcing** (Kleppmann, "Turning the database inside out"). Separate *events* ("stirring
-  stopped at 10:32"), *current state* ("stirring is stopped") and *derived facts* ("needs
-  attention"). Derive facts from current state rather than retracting them by hand. Treat readings
-  as known, stale or unknown by age. → Kept as a way of thinking, no event bus built.
-- **Cybernetics.** It adds something only if it changes design decisions. It does, in three:
+Directions LARR-E is built to grow into. None is needed for the demo. Each one plugs into
+something that already exists, which is the point of the current design.
+
+- **Twitch: the experiment as a public broadcast.** A webcam on the reactor, an overlay of live
+  readings, the agent's commentary, and the audience predicting the growth curve, scored against
+  LARR-E and the measured one. Plugs into the HTTP API (`/api/status`, alerts, data), the same feed
+  the 3DS uses. Viewers never control hardware.
+- **Drawing experiments on the 3DS.** Draw a stirring or temperature curve with the stylus. It
+  becomes an `ExperimentPlan` whose profile carries timed `update` actions, shown for approval on
+  the top screen and approved with Ⓐ. Plugs into `experiment.py`, which already emits profiles, and
+  the existing approval gate.
+- **Attention rules in Datalog.** Facts (readings, job states, the plan's expected state, how stale
+  each reading is) plus rules that decide *whether to wake the LLM* and whether to interrupt the
+  scientist. This weekend a few Python conditions in `listener.py` do the job (pyDatalog was
+  considered and dropped). Datalog pays off when the rules are numerous, written by scientists, or
+  need explaining ("why did you page me?"). The same machinery could describe which actions are
+  permitted, as a policy.
+- **One event log, many views** (Kleppmann, "Turning the database inside out"). Keep *events*
+  ("stirring stopped at 10:32"), *current state* ("stirring is stopped") and *derived facts* ("needs
+  attention") apart. Derive facts from state, never retract them by hand, and mark readings known,
+  stale or unknown by age. Today alerts, audit and plans are separate files in `runtime/`. Merged
+  into one append-only log, Slack, the 3DS, Twitch and triage all become views of it.
+- **A fuller agent runtime (Tau).** Swap `agent.py`'s loop for Tau to get sessions, context
+  management and event-triggered turns. The tools in `tools.py` stay as they are.
+- **Cybernetics as the explanation, and feedforward as a feature.** Three feedback loops at three
+  timescales: Pioreactor (seconds to minutes), LARR-E (minutes to hours), the scientist (hours to
+  days). It changes three design decisions:
   1. **Don't duplicate feedback loops:** Pioreactor holds setpoints, Claude supervises.
   2. **A deviation isn't a failure:** investigate before acting.
   3. **Escalate only when needed.**
 
-  There are three loops at three timescales: Pioreactor (seconds to minutes), LARR-E (minutes to
-  hours), the scientist (hours to days). Good for one slide, not for jargon in the pitch.
+  The extension is *feedforward*: the agent schedules an intervention before it's needed (profile
+  `when` and `repeat` actions) instead of reacting to a deviation. One slide in the pitch, no jargon.
+- **A remote, multi-site cluster.** Tailscale on each leader, which Pioreactor documents, plus
+  `LARRE_LEADERS` pointing at their addresses. Real reactors in different labs under one agent,
+  next to digital twins.
 
 ## 4. Earlier advice that was wrong or unchecked
 

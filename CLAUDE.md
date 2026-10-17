@@ -1,7 +1,7 @@
 # LARR-E: working notes for Claude Code and the team
 
 Read this first. It records what was decided and why, the rules for changing the code, and what's
-still open. History and parked ideas: `docs/design-notes.md`. Raw material (the ChatGPT design
+still open. History and planned extensions: `docs/design-notes.md`. Raw material (the ChatGPT design
 thread, the organisers' prompting playbook) may be in `notes/`, which is gitignored. Read it only
 when asked: it is long, and most of it is superseded by this file.
 
@@ -69,8 +69,10 @@ the same interfaces.
    considered. It would add sessions and context management, but migrating is a risk with no demo
    payoff. Keep tools independent of the loop so it can be swapped later. Long experiments don't
    need long contexts: the plan and history live outside the model.
-10. **No Datalog/Prolog, no event bus, no new scheduler.** Plain Python conditions decide when to
-    involve Claude. Parked ideas are in `docs/design-notes.md`.
+10. **No Datalog/Prolog, no event bus, no new scheduler this weekend.** Plain Python conditions
+    decide when to involve Claude. These are extensions, not rejections: see `docs/design-notes.md`
+    section 3 for Twitch, drawing profiles on the 3DS, Datalog attention rules, an event log, Tau and
+    a remote cluster, and where each one plugs in.
 11. **Secrets live in `.env`** (gitignored, loaded by `config.py`). Claude Code is denied reading it
     (`.claude/settings.json`). Never print or echo secrets. Use a dedicated Anthropic key with a
     spend limit.
@@ -109,6 +111,7 @@ Pioreactor source is importable.
 | REST transport, stop by job id, experiment from leader | Built, tested against the twin and a fake leader |
 | Digital twin (`larr-e twin`), faults, `/twin/state` | Built, tested end to end |
 | Listener recorder, `list_units`, `/larr-e units` | Built, tested |
+| 3DS: browser dashboard and native PocketJS app with an Ⓐ/Ⓑ approval gate | Built (by the team, before this branch). Shown in the PocketJS simulator; check it on the handheld |
 | Real Pi on the phone hotspot | Laptop reaches `pioreactor.local`. **Not yet confirmed:** software version, MQTT login, and a real 5-minute plan starting and stopping on schedule |
 | `.env`, uv, LICENSE | Done (LICENSE only on `alethkit` main) |
 

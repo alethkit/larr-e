@@ -23,7 +23,7 @@ from rich.table import Table
 
 from config import Settings, settings as default_settings
 from openai_compat import ChatBackend, LLMError, to_openai_tools
-from tools import METRIC_TABLES, PUMP_JOBS, STARTABLE_JOBS, STOPPABLE_JOBS, PioreactorTools, ToolError
+from tools import AUDIT_KINDS, METRIC_TABLES, PUMP_JOBS, STARTABLE_JOBS, STOPPABLE_JOBS, PioreactorTools, ToolError, utc_timestamp
 
 console = Console()
 
@@ -67,6 +67,8 @@ Rules:
 - If a request is ambiguous in a way that matters for hardware (which unit, how much), ask instead of guessing.
 - If the user declines a confirmation, stop and say nothing was changed.
 - Never state a reading you have not fetched with a tool in this conversation.
+- For what LARR-E did or was asked to do (pump runs, who approved what, changes today), use audit_log;
+  the Pioreactor's own dosing table is on the Pi, not here.
 - Live readings marked stale (see seconds_since_last_reading and age_s) are old: the job that
   publishes them has probably stopped. Say so instead of presenting them as current.
 - Reply in a few short lines suitable for a terminal or Slack message: what you did or found, with numbers.
@@ -144,6 +146,14 @@ READ_TOOLS = [
         "list_recent_alerts",
         "The most recent anomaly alerts raised by the LARR-E listener.",
         {"limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+        [],
+    ),
+    _tool(
+        "audit_log",
+        "LARR-E's own record of hardware actions over the last N hours: who asked, who approved, and "
+        "whether it worked. Use it for questions like 'audit the pump runs' or 'what changed today'.",
+        {"hours": {"type": "number", "minimum": 0.1, "maximum": 720},
+         "kind": {"type": "string", "enum": sorted(AUDIT_KINDS)}},
         [],
     ),
 ]
@@ -315,6 +325,7 @@ class LarreAgent:
             "plot_timeseries": t.plot_timeseries,
             "query_database": t.query_database,
             "list_recent_alerts": t.list_recent_alerts,
+            "audit_log": t.audit_log,
             "dose": t.dose,
             "set_target_temperature": t.set_target_temperature,
             "set_stirring_rpm": t.set_stirring_rpm,
@@ -350,7 +361,25 @@ class LarreAgent:
             console.print(f"[{style}]  ← {json.dumps(result, default=str)[:300]}[/{style}]")
         if self.on_tool_result:
             self.on_tool_result(name, args, result, is_error)
+        if name in ACTION_TOOL_NAMES and not result.get("declined"):
+            self._audit_result(name, args, result, is_error)
         return result, is_error
+
+    def _audit_result(self, name: str, args: dict[str, Any], result: dict[str, Any], is_error: bool) -> None:
+        """The front end logged the decision; this logs what actually happened."""
+        record = {
+            "at": utc_timestamp(), "source": "agent", "tool": name, "args": args,
+            "result": "error" if is_error else "ok",
+            "detail": str(result.get("error") or result.get("note") or "")[:200],
+            "dry_run": self.tools.dry_run,
+        }
+        path = self.cfg.output.audit_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except OSError as exc:  # an unwritable log must not stop the lab
+            console.print(f"[yellow]Could not write the audit log: {exc}[/yellow]")
 
     def _run_tool(self, block: Any) -> dict[str, Any]:
         result, is_error = self._execute(block.name, dict(block.input or {}))

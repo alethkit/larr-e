@@ -202,6 +202,8 @@ class OutputConfig:
     audit_path: Path = RUNTIME_DIR / "audit.jsonl"  # who requested and who approved each hardware action
     plans_path: Path = RUNTIME_DIR / "experiment_plans.json"  # the active plan per unit
     plots_dir: Path = RUNTIME_DIR / "plots"
+    # A live reading older than this is reported as stale (Pioreactor publishes every 5-60 s).
+    stale_after_s: float = _env_float("LARRE_STALE_S", 180.0)
     # Webhook posting from listener.py. Leave unset when slack_bot.py is running,
     # which posts the same alerts itself with buttons and threads.
     slack_webhook_url: str | None = _env("LARRE_SLACK_WEBHOOK_URL")

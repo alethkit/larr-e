@@ -7,6 +7,7 @@ then sets the job's $state to "disconnected" (background_jobs/base.py:880-894).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 import sys
@@ -16,7 +17,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import Settings  # noqa: E402
-from listener import AnomalyDetector, JobStates, StopAwareGate, handle_message  # noqa: E402
+from listener import AnomalyDetector, JobStates, LiveState, StopAwareGate, handle_message  # noqa: E402
+from tools import PioreactorTools  # noqa: E402
 
 UNIT, EXP = "pio01", "demo"
 
@@ -43,6 +45,15 @@ class FakeState:
 
     def update(self, reading) -> None:
         self.readings.append(reading)
+
+    def clear(self, unit, metric) -> None:
+        pass
+
+
+def tmp_settings(tmp_path: Path) -> Settings:
+    base = Settings()
+    out = dataclasses.replace(base.output, runtime_dir=tmp_path, state_path=tmp_path / "live_state.json")
+    return dataclasses.replace(base, output=out)
 
 
 def feed(detector, metric_topic, key, values, clock=None, step_s=30.0):
@@ -128,3 +139,32 @@ def test_warm_up_starts_again_when_the_thermostat_restarts():
     handle_message(topic("temperature_automation", "$state"), b"ready", state=FakeState(),
                    detector=detector, emit=lambda a: None, jobs=JobStates())
     assert feed(detector, temp, "temperature", [20.5], clock=clock) == []
+
+
+# ------------------------------------------------------------------ stale readings must not look live
+
+
+def test_a_stopped_job_clears_its_live_reading(tmp_path):
+    # A Pioreactor job that stops clears its retained settings with empty payloads (base.py:1057-1070).
+    state = LiveState(tmp_settings(tmp_path))
+    rpm = topic("stirring", "measured_rpm")
+    handle_message(rpm, payload("measured_rpm", 500), state=state, detector=AnomalyDetector(Settings()), emit=print)
+    handle_message(rpm, b"", state=state, detector=AnomalyDetector(Settings()), emit=print)
+    state.flush()
+    assert "stirring" not in json.loads((tmp_path / "live_state.json").read_text())[UNIT]
+
+
+def test_live_status_says_how_old_each_reading_is(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    iso = lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")  # noqa: E731
+    (tmp_path / "live_state.json").write_text(json.dumps({UNIT: {
+        "experiment": EXP,
+        "last_seen": iso(now),
+        "stirring": {"value": 474.0, "timestamp": iso(now - timedelta(hours=1))},
+        "temperature": {"value": 30.0, "timestamp": iso(now - timedelta(seconds=10))},
+    }}))
+    status = PioreactorTools(tmp_settings(tmp_path)).get_live_status(UNIT)[UNIT]
+    assert status["stirring"]["stale"] is True and status["stirring"]["age_s"] >= 3500
+    assert status["temperature"]["stale"] is False

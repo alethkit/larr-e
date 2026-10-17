@@ -545,8 +545,15 @@ def status_cmd() -> None:
     for col in ("unit", "experiment", "OD", "temp °C", "growth h⁻¹", "RPM", "last seen"):
         table.add_column(col)
     for unit, s in sorted(state.items()):
-        od = ", ".join(f"{k}={v['value']:.3f}" for k, v in sorted(s.get("od", {}).items()))
-        get = lambda key, fmt: format(s[key]["value"], fmt) if key in s else "—"  # noqa: E731
+        def show(entry: dict, fmt: str) -> str:
+            text = format(entry["value"], fmt)
+            if entry.get("stale"):
+                age = entry.get("age_s")
+                text = f"[dim]{text} ({age // 60} min old)[/dim]" if age is not None else f"[dim]{text} (stale)[/dim]"
+            return text
+
+        od = ", ".join(f"{k}={show(v, '.3f')}" for k, v in sorted(s.get("od", {}).items()))
+        get = lambda key, fmt: show(s[key], fmt) if key in s else "—"  # noqa: E731
         table.add_row(
             unit, s.get("experiment", "—"), od or "—", get("temperature", ".2f"),
             get("growth_rate", ".3f"), get("stirring", ".0f"), s.get("last_seen", "—"),

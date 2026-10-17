@@ -69,23 +69,29 @@ class Reading:
     topic: str
 
 
-def parse_message(topic: str, payload: bytes) -> Reading | None:
-    """Turn a Pioreactor telemetry message into a Reading, or None to ignore it."""
+def metric_for_topic(topic: str) -> tuple[str, str, str, str] | None:
+    """(unit, experiment, metric, payload key) for a telemetry topic, or None."""
     parts = topic.split("/")
     if len(parts) != 5 or parts[0] != "pioreactor":
         return None
     _, unit, experiment, job, attr = parts
-
     if job == "od_reading" and OD_CHANNEL.match(attr):
-        metric, key = attr, "od"
-    elif job == "growth_rate_calculating" and attr == "growth_rate":
-        metric, key = "growth_rate", "growth_rate"
-    elif job in {"temperature_automation", "temperature_control"} and attr == "temperature":
-        metric, key = "temperature", "temperature"
-    elif job == "stirring" and attr == "measured_rpm":
-        metric, key = "stirring", "measured_rpm"
-    else:
+        return unit, experiment, attr, "od"
+    if job == "growth_rate_calculating" and attr == "growth_rate":
+        return unit, experiment, "growth_rate", "growth_rate"
+    if job in {"temperature_automation", "temperature_control"} and attr == "temperature":
+        return unit, experiment, "temperature", "temperature"
+    if job == "stirring" and attr == "measured_rpm":
+        return unit, experiment, "stirring", "measured_rpm"
+    return None
+
+
+def parse_message(topic: str, payload: bytes) -> Reading | None:
+    """Turn a Pioreactor telemetry message into a Reading, or None to ignore it."""
+    found = metric_for_topic(topic)
+    if found is None:
         return None
+    unit, experiment, metric, key = found
 
     if not payload:
         return None  # retained-message clears
@@ -281,6 +287,16 @@ class LiveState:
             if time.monotonic() - self._last_flush >= 1.0:
                 self._flush()
 
+    def clear(self, unit: str, metric: str) -> None:
+        """A stopped job cleared this reading: drop it rather than keep showing the last value."""
+        with self._lock:
+            entry = self.state.get(unit, {})
+            if metric.startswith("od"):
+                entry.get("od", {}).pop(metric, None)
+            else:
+                entry.pop(metric, None)
+            self._flush()
+
     def _flush(self) -> None:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=2))
@@ -409,6 +425,11 @@ def handle_message(
                 jobs.update(unit, job, value)
             if value == "ready":
                 detector.job_started(unit, job)
+            return
+        if not payload:  # a stopping job clears its retained readings
+            found = metric_for_topic(topic)
+            if found:
+                state.clear(found[0], found[2])
             return
         reading = parse_message(topic, payload)
         if reading is None:

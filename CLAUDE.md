@@ -163,6 +163,8 @@ directly leaves `amqtt` off PATH, and the end-to-end twin tests then skip silent
      itself but missed the readings in between, including one stall.
    - **`pioreactor.local` (mDNS) lookups are flaky**, and inside Claude Code's sandbox ssh and MQTT
      can't resolve it at all (curl works through the proxy). Expect a few seconds' delay on connect.
+     Plan: Tailscale (`docs/tailscale.md`): a separate twin test stack on a server, `pio01` on
+     the tailnet, and `.env` pointed at `pio01` instead of `pioreactor.local`. Not yet done.
    - The `./.env.*` read deny also hides `.env.example` from Claude Code.
 
 ## Running it

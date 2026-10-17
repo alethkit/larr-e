@@ -3,6 +3,10 @@
 Every request needs the shared token, as `?k=<token>` or an `X-Larre-Token` header.
 
     GET  /                      dashboard page (open /?k=<token> on the 3DS browser or a phone)
+    GET  /plan                  plan editor: drag the numbers, see the profile and the ghost line
+    GET  /api/plan?unit=pio01   the saved plan for a unit (or all units)
+    POST /api/plan/preview      {"name", "duration_h", "temperature_c", "rpm", "unit"} -> plan + YAML + limits
+    POST /api/plan/start        same body; waits for approval, no LLM -> {"job_id": ...}
     GET  /api/status            live telemetry from listener.py
     GET  /api/alerts?n=5        recent alerts
     GET  /api/series?metric=od&unit=worker1&minutes=30&points=40
@@ -46,6 +50,7 @@ from tools import METRIC_TABLES, PioreactorTools, ToolError, parse_timestamp, ut
 log = logging.getLogger("larre.api")
 
 DASHBOARD_PATH = Path(__file__).resolve().parent / "web" / "dashboard.html"
+PLAN_PAGE_PATH = Path(__file__).resolve().parent / "web" / "plan.html"
 
 STYLES = {
     "3ds": "Your answer is shown on a Nintendo 3DS screen: plain text only, no Markdown, "
@@ -306,6 +311,50 @@ class LarreService:
         with self.cfg.output.audit_path.open("a") as f:
             f.write(json.dumps(record) + "\n")
 
+    # ---------------------------------------------------------------- plan page (no LLM)
+
+    PLAN_FIELDS = {"name", "duration_h", "temperature_c", "rpm", "unit", "update_every_h", "notes"}
+
+    def _plan_args(self, body: dict[str, Any]) -> dict[str, Any]:
+        unknown = set(body) - self.PLAN_FIELDS
+        if unknown:
+            raise ValueError(f"unknown plan fields {sorted(unknown)}")
+        return {k: v for k, v in body.items() if v is not None}
+
+    def preview_plan(self, body: dict[str, Any]) -> dict[str, Any]:
+        """The plan, its profile YAML, and the safety limits the page's draggable numbers stay within."""
+        out = self.tools.plan_experiment(**self._plan_args(body))
+        lim = self.cfg.safety
+        out["limits"] = {
+            "temperature_c": [lim.min_temperature_c, lim.max_temperature_c],
+            "rpm": [1, lim.max_stirring_rpm],
+            "duration_h": [0.05, self.cfg.plans.max_duration_h],
+        }
+        return out
+
+    def start_plan(self, body: dict[str, Any], source: str) -> Job:
+        """Start a plan straight from the page: validate now, then wait for the same approval gate."""
+        args = self._plan_args(body)
+        self.tools.start_experiment(check_only=True, **args)  # refuse bad plans before asking anyone
+        job = Job(uuid.uuid4().hex[:10], f"Start plan: {args.get('name', '')}", "plan", source)
+        with self.lock:
+            self.jobs[job.id] = job
+        self.pool.submit(self._run_plan, job, args)
+        return job
+
+    def _run_plan(self, job: Job, args: dict[str, Any]) -> None:
+        try:
+            if not self.request_approval(job, "start_experiment", args):
+                job.answer, job.state = "Not started: the request was denied or expired.", "done"
+                return
+            out = self.tools.start_experiment(**args)
+            job.answer, job.state = f"Started {out['plan']['summary']}", "done"
+        except ToolError as exc:
+            job.answer, job.state = str(exc), "error"
+        except Exception as exc:  # the API server must survive any job failure
+            log.exception("Plan job %s failed", job.id)
+            job.answer, job.state = f"Internal error: {exc}", "error"
+
     # ---------------------------------------------------------------- data
 
     def recent_alerts(self, limit: int) -> dict[str, Any]:
@@ -396,6 +445,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and not parts:
                 self._send(200, DASHBOARD_PATH.read_bytes(), "text/html; charset=utf-8")
+            elif method == "GET" and parts == ["plan"]:
+                self._send(200, PLAN_PAGE_PATH.read_bytes(), "text/html; charset=utf-8")
+            elif method == "GET" and parts == ["api", "plan"]:
+                self._json(200, svc.tools.get_experiment_plan(q("unit")))
+            elif method == "POST" and parts == ["api", "plan", "preview"]:
+                self._json(200, svc.preview_plan(self._body()))
+            elif method == "POST" and parts == ["api", "plan", "start"]:
+                job = svc.start_plan(self._body(), source="plan-page")
+                self._json(202, {"job_id": job.id})
             elif method == "GET" and parts == ["api", "status"]:
                 self._json(200, svc.tools.get_live_status(include_history=q("history") == "1"))
             elif method == "GET" and parts == ["api", "screen"]:

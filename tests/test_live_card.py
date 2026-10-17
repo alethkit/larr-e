@@ -230,3 +230,199 @@ def test_a_progress_update_does_not_lose_a_change_made_while_it_was_drawing(tmp_
     bot.check_plans()
     after = bot.tools.plans.get("pio1")
     assert after.target("stirring") == 350 and after.last_update_at and after.slack_card_ts
+
+
+# ------------------------------------------------------------------ piece 4: steppers propose, Apply approves
+
+import dataclasses  # noqa: E402
+import json  # noqa: E402
+
+from tools import ToolError  # noqa: E402
+
+
+def action_ids(msg):
+    return [e.get("action_id") for b in msg.get("blocks") or [] if b["type"] == "actions" for e in b["elements"]]
+
+
+def last_card(bot):
+    return bot.client.updates[-1] if bot.client.updates else bot.client.posts[-1]
+
+
+def card_bot(tmp_path, self_approval=True, **plan_kw):
+    cfg = make_settings(tmp_path)
+    cfg = dataclasses.replace(cfg, slack=dataclasses.replace(cfg.slack, allow_self_approval=self_approval, approvers=frozenset()))
+    bot = live_bot(tmp_path, cfg, **plan_kw)
+    bot.calls = []
+    bot.tools.set_target_temperature = lambda celsius, unit=None: bot.calls.append(("temperature", celsius, unit)) or {"ok": True}
+    bot.tools.set_stirring_rpm = lambda rpm, unit=None: bot.calls.append(("stirring", rpm, unit)) or {"ok": True}
+    bot.post_progress(bot.tools.plans.get("pio1"))  # the live card
+    return bot
+
+
+def test_the_card_has_steppers_for_what_the_plan_controls(tmp_path):
+    bot = card_bot(tmp_path)
+    ids = action_ids(bot.client.posts[0])
+    assert {"larre_step_temp_down", "larre_step_temp_up", "larre_step_rpm_down", "larre_step_rpm_up"} <= set(ids)
+    assert "larre_apply" not in ids and "larre_cancel" not in ids  # nothing proposed yet
+
+
+def test_no_temperature_steppers_when_the_plan_leaves_temperature_alone(tmp_path):
+    bot = card_bot(tmp_path)
+    plan = bot.tools.plans.get("pio1")
+    plan.temperature_c = None
+    bot.tools.plans.put(plan)
+    bot.post_progress(plan)
+    ids = action_ids(last_card(bot))
+    assert "larre_step_rpm_up" in ids and "larre_step_temp_up" not in ids
+
+
+def test_a_stepper_proposes_and_redraws_but_does_not_act(tmp_path):
+    bot = card_bot(tmp_path)
+    assert bot.step("pio1", "U1", "larre_step_temp_up") is None
+    assert bot.step("pio1", "U1", "larre_step_temp_up") is None
+    assert bot.calls == []  # nothing sent to the reactor
+    assert bot.tools.plans.get("pio1").target("temperature") == 30
+    card = last_card(bot)
+    assert card["ts"] == bot.tools.plans.get("pio1").slack_card_ts  # same card, edited
+    assert "32" in card["text"] and "proposed" in card["text"].lower()
+    assert {"larre_apply", "larre_cancel"} <= set(action_ids(card))
+    assert bot.proposed_values("pio1") == {"temperature": 32}
+
+
+def test_steppers_stop_at_the_safety_limits(tmp_path):
+    bot = card_bot(tmp_path)
+    lim = bot.cfg.safety
+    for _ in range(int(lim.max_stirring_rpm / 50) + 3):
+        bot.step("pio1", "U1", "larre_step_rpm_up")
+    assert bot.proposed_values("pio1")["stirring"] == lim.max_stirring_rpm
+
+
+def test_stepping_back_to_the_current_setpoint_withdraws_the_proposal(tmp_path):
+    bot = card_bot(tmp_path)
+    bot.step("pio1", "U1", "larre_step_rpm_up")
+    bot.step("pio1", "U1", "larre_step_rpm_down")
+    assert bot.proposed_values("pio1") is None
+    assert "larre_apply" not in action_ids(last_card(bot))
+
+
+def test_cancel_drops_the_proposal(tmp_path):
+    bot = card_bot(tmp_path)
+    bot.step("pio1", "U1", "larre_step_rpm_up")
+    assert bot.cancel("pio1", "U1") is None
+    assert bot.proposed_values("pio1") is None and bot.calls == []
+    assert "larre_apply" not in action_ids(last_card(bot))
+
+
+def test_apply_changes_the_setpoint_and_records_it_on_the_plan(tmp_path):
+    bot = card_bot(tmp_path)
+    bot.step("pio1", "U1", "larre_step_rpm_up")
+    bot.step("pio1", "U1", "larre_step_temp_down")
+    assert bot.apply("pio1", "U1") is None
+    assert sorted(bot.calls) == [("stirring", 350, "pio1"), ("temperature", 29, "pio1")]
+    plan = bot.tools.plans.get("pio1")
+    assert plan.target("stirring") == 350 and plan.target("temperature") == 29
+    assert {sp["by"] for sp in plan.setpoints} == {"U1"}
+    assert plan.expected_state()["target_rpm"] == 350
+    assert bot.proposed_values("pio1") is None
+    card = last_card(bot)
+    assert "larre_apply" not in action_ids(card) and "larre_step_rpm_up" in action_ids(card)
+    said = [p["text"] for p in bot.client.posts[1:]]
+    assert any("350" in t and "<@U1>" in t for t in said)  # a thread note: who changed what
+    audit = [json.loads(line) for line in bot.cfg.output.audit_path.read_text().splitlines()]
+    assert audit[-1]["decision"] == "approved" and audit[-1]["decided_by"] == "U1"
+
+
+def test_two_person_rule_applies_to_apply(tmp_path):
+    bot = card_bot(tmp_path, self_approval=False)
+    bot.step("pio1", "U1", "larre_step_rpm_up")
+    error = bot.apply("pio1", "U1")
+    assert error and "Two-person" in error and bot.calls == []
+    assert bot.proposed_values("pio1") == {"stirring": 350}  # still waiting for a second person
+    assert bot.apply("pio1", "U2") is None
+    assert bot.calls == [("stirring", 350, "pio1")]
+
+
+def test_anyone_who_adjusted_the_proposal_counts_as_its_requester(tmp_path):
+    bot = card_bot(tmp_path, self_approval=False)
+    bot.step("pio1", "U1", "larre_step_rpm_up")
+    bot.step("pio1", "U2", "larre_step_rpm_up")
+    assert bot.apply("pio1", "U2") and bot.apply("pio1", "U1") and bot.calls == []
+    assert bot.apply("pio1", "U3") is None
+
+
+def test_approver_list_applies_to_apply(tmp_path):
+    bot = card_bot(tmp_path)
+    bot.cfg = dataclasses.replace(bot.cfg, slack=dataclasses.replace(bot.cfg.slack, approvers=frozenset({"U9"})))
+    bot.step("pio1", "U1", "larre_step_rpm_up")
+    assert bot.apply("pio1", "U1") and bot.calls == []
+    assert bot.apply("pio1", "U9") is None
+
+
+def test_a_refused_change_is_not_recorded(tmp_path):
+    bot = card_bot(tmp_path)
+
+    def refuse(rpm, unit=None):
+        raise ToolError("MQTT publish failed")
+
+    bot.tools.set_stirring_rpm = refuse
+    bot.step("pio1", "U1", "larre_step_rpm_up")
+    error = bot.apply("pio1", "U1")
+    assert error and "MQTT publish failed" in error
+    assert bot.tools.plans.get("pio1").setpoints == []
+
+
+def test_buttons_on_a_finished_plan_do_nothing(tmp_path):
+    bot = card_bot(tmp_path)
+    plan = bot.tools.plans.get("pio1")
+    plan.status = "stopped"
+    bot.tools.plans.put(plan)
+    assert bot.step("pio1", "U1", "larre_step_rpm_up")
+    assert bot.proposed_values("pio1") is None
+    assert "larre_step_rpm_up" not in action_ids(last_card(bot))  # the card loses its buttons
+
+
+def test_apply_with_nothing_proposed_says_so(tmp_path):
+    bot = card_bot(tmp_path)
+    assert bot.apply("pio1", "U1") and bot.calls == []
+
+
+def test_button_clicks_reach_step_apply_and_cancel(tmp_path):
+    import re
+
+    import pytest
+
+    pytest.importorskip("slack_bolt")
+    from slack_bot import LarreBot
+
+    handlers = {}
+
+    class App:
+        client = LiveSlack()
+
+        def event(self, *_):
+            return lambda f: f
+
+        command = event
+
+        def action(self, key):
+            return lambda f: handlers.setdefault(key, f)
+
+    bot = LarreBot(make_settings(tmp_path), app=App(), bot_user_id="UBOT")
+    bot.submit = lambda fn, *a: fn(*a)
+    seen = []
+    bot.step = lambda unit, user, action_id: seen.append(("step", unit, user, action_id))
+    bot.apply = lambda unit, user: seen.append(("apply", unit, user)) or "nope"
+
+    def click(action_id):
+        (handler,) = [f for k, f in handlers.items()
+                      if (k.match(action_id) if isinstance(k, re.Pattern) else k == action_id)]
+        body = {"user": {"id": "U1"}, "channel": {"id": "C1"}, "actions": [{"action_id": action_id, "value": "pio1"}]}
+        handler(ack=lambda *a, **k: None, body=body)
+
+    # handlers were bound before the fakes above, so re-register them against the fakes
+    handlers.clear()
+    bot._register_handlers()
+    click("larre_step_rpm_up")
+    click("larre_apply")
+    assert seen == [("step", "pio1", "U1", "larre_step_rpm_up"), ("apply", "pio1", "U1")]
+    assert bot.client.ephemeral[-1]["text"] == "nope"  # an error goes to the clicker privately

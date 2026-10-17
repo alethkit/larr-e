@@ -111,6 +111,26 @@ class PendingApproval:
 
 
 @dataclass
+class Proposal:
+    """A setpoint change drawn on a plan card with the stepper buttons, not yet applied."""
+    values: dict[str, float] = field(default_factory=dict)  # metric -> proposed setpoint
+    proposers: set[str] = field(default_factory=set)  # everyone who adjusted it: none of them may Apply alone
+
+
+# Stepper buttons on the plan card: action_id -> (metric, step).
+STEPPERS = {
+    "larre_step_temp_down": ("temperature", -1.0),
+    "larre_step_temp_up": ("temperature", 1.0),
+    "larre_step_rpm_down": ("stirring", -50.0),
+    "larre_step_rpm_up": ("stirring", 50.0),
+}
+STEPPER_LABELS = {"larre_step_temp_down": "−1 °C", "larre_step_temp_up": "+1 °C",
+                  "larre_step_rpm_down": "−50 rpm", "larre_step_rpm_up": "+50 rpm"}
+SETPOINT_UNITS = {"temperature": "°C", "stirring": "rpm"}
+SETPOINT_TOOLS = {"temperature": "set_target_temperature", "stirring": "set_stirring_rpm"}
+
+
+@dataclass
 class Conversation:
     channel: str
     thread_ts: str | None  # None means top-level replies (DMs)
@@ -135,6 +155,7 @@ class LarreBot:
         self.approvals: dict[str, PendingApproval] = {}
         self.alerts: dict[str, dict[str, Any]] = {}
         self.alert_threads: dict[str, tuple[str, str]] = {}
+        self.proposals: dict[str, Proposal] = {}  # unit -> setpoint change waiting on the plan card
         self.plan_lock = threading.RLock()  # read-modify-write of saved plans (progress loop vs. button clicks)
         self.file_ready_delay_s = 2.0  # Slack may need a moment before an upload can appear in a message
         self._register_handlers()
@@ -490,9 +511,139 @@ class LarreBot:
         return result.get("gif_path") or result["png_path"], "plan vs measured: " + (", ".join(off) or "on target throughout")
 
     def card_actions(self, plan: Any, final: bool = False) -> list[dict[str, Any]]:
-        """The buttons under the chart."""
-        button = None if final else self.adjust_button(plan.unit)
-        return [{"type": "actions", "elements": [button]}] if button else []
+        """The buttons under the chart: steppers for each setpoint the plan controls (they only propose),
+        Apply / Cancel while a change is proposed, and the link to the /plan page."""
+        if final or plan.status != "running":
+            return []
+        button = lambda action_id, label, **kw: {  # noqa: E731
+            "type": "button", "action_id": action_id, "value": plan.unit,
+            "text": {"type": "plain_text", "text": label}, **kw}
+        steppers = [button(a, STEPPER_LABELS[a]) for a, (metric, _) in STEPPERS.items() if plan.target(metric) is not None]
+        rows = [{"type": "actions", "block_id": "larre_steppers", "elements": steppers}] if steppers else []
+        decide = []
+        if plan.unit in self.proposals:
+            decide = [button("larre_apply", "Apply", style="primary"), button("larre_cancel", "Cancel")]
+        link = self.adjust_button(plan.unit)
+        if decide or link:
+            rows.append({"type": "actions", "block_id": "larre_decide", "elements": decide + ([link] if link else [])})
+        return rows
+
+    def proposed_values(self, unit: str) -> dict[str, float] | None:
+        with self.lock:
+            proposal = self.proposals.get(unit)
+            return dict(proposal.values) if proposal else None
+
+    def proposal_note(self, plan: Any) -> str:
+        with self.lock:
+            proposal = self.proposals.get(plan.unit)
+            if not proposal:
+                return ""
+            values, proposers = dict(proposal.values), sorted(proposal.proposers)
+        changes = ", ".join(f"{m} {v:g} {SETPOINT_UNITS[m]} (now {plan.target(m):g})" for m, v in values.items())
+        who = ("anyone on the approver list" if self.cfg.slack.allow_self_approval
+               else "someone other than " + ", ".join(f"<@{u}>" for u in proposers) + " (two-person rule)")
+        dry = " _(dry run: nothing will move)_" if self.tools.dry_run else ""
+        return f":pencil2: *Proposed change:* {changes}. Nothing has changed yet: *Apply* needs {who}.{dry}"
+
+    def refresh_card(self, plan: Any, note: str = "") -> None:
+        """Redraw the plan's live card (after a button click)."""
+        target = self._update_target(plan)
+        if target:
+            self.post_plan_card(target[0], target[1], plan, self.progress_text(plan), note=note)
+
+    def _running_plan(self, unit: str) -> tuple[Any, str | None]:
+        plan = self.tools.plans.get(unit)
+        if plan is None:
+            return None, f"No plan for `{unit}`."
+        if plan.status != "running":
+            with self.lock:
+                self.proposals.pop(unit, None)
+            self.refresh_card(plan)  # take the buttons off
+            return None, f"The plan on `{unit}` is {plan.status}; there is nothing to adjust."
+        return plan, None
+
+    def step(self, unit: str, user: str, action_id: str) -> str | None:
+        """A stepper click: move the proposed setpoint one step and redraw. Changes nothing on the reactor.
+        Returns an error to show the clicker privately, or None."""
+        plan, error = self._running_plan(unit)
+        if error:
+            return error
+        metric, delta = STEPPERS[action_id]
+        if plan.target(metric) is None:
+            return f"This plan doesn't control {metric}."
+        lim = self.cfg.safety
+        lo, hi = ((lim.min_temperature_c, lim.max_temperature_c) if metric == "temperature"
+                  else (0.0, float(lim.max_stirring_rpm)))
+        current = plan.target(metric)
+        with self.lock:
+            proposal = self.proposals.setdefault(unit, Proposal())
+            new = min(hi, max(lo, proposal.values.get(metric, current) + delta))
+            proposal.proposers.add(user)
+            if new == current:
+                proposal.values.pop(metric, None)
+            else:
+                proposal.values[metric] = new
+            if not proposal.values:
+                del self.proposals[unit]
+        self.refresh_card(plan)
+        return None
+
+    def cancel(self, unit: str, user: str) -> str | None:
+        with self.lock:
+            dropped = self.proposals.pop(unit, None)
+        plan = self.tools.plans.get(unit)
+        if plan:
+            self.refresh_card(plan, note=f"_<@{user}> cancelled the proposed change._" if dropped else "")
+        return None
+
+    def apply(self, unit: str, user: str) -> str | None:
+        """Apply is the approval: same approver list and two-person rule as the Approve button. Sends each
+        proposed setpoint to the reactor, then records it on the saved plan. Returns an error or None."""
+        plan, error = self._running_plan(unit)
+        if error:
+            return error
+        with self.lock:
+            proposal = self.proposals.get(unit)
+            if proposal is None:
+                return "Nothing is proposed: use the − / + buttons first."
+            approvers = self.cfg.slack.approvers
+            if approvers and user not in approvers:
+                return "You are not on the approver list for hardware actions."
+            if user in proposal.proposers and not self.cfg.slack.allow_self_approval:
+                return "Two-person rule: someone who didn't adjust this proposal must apply it."
+            del self.proposals[unit]  # taken: a second click finds nothing to apply
+        done, failed = [], {}
+        for metric, value in proposal.values.items():
+            tool, was = SETPOINT_TOOLS[metric], plan.target(metric)
+            args = {"unit": unit, ("celsius" if metric == "temperature" else "rpm"): value}
+            try:
+                getattr(self.tools, tool)(**args)
+            except ToolError as exc:
+                failed[metric] = str(exc)
+                continue
+            self.audit(PendingApproval("card", tool, args, ",".join(sorted(proposal.proposers)),
+                                       plan.slack_channel or "", plan.slack_thread_ts, decided_by=user), "approved")
+            with self.plan_lock:
+                saved = self.tools.plans.get(unit)
+                if saved and (saved.name, saved.started_at) == (plan.name, plan.started_at):
+                    saved.set_target(metric, value, by=user)
+                    self.tools.plans.put(saved)
+                    plan = saved
+            done.append(f"{metric} {was:g} → {value:g} {SETPOINT_UNITS[metric]}")
+        if failed:
+            with self.lock:  # leave what didn't go through on the card, to retry or cancel
+                self.proposals.setdefault(unit, Proposal(proposers=set(proposal.proposers))).values.update(
+                    {m: proposal.values[m] for m in failed})
+        channel, thread_ts = self._update_target(plan) or (None, None)
+        if done and channel:
+            by = ", ".join(f"<@{u}>" for u in sorted(proposal.proposers))
+            dry = " _(dry run: nothing moved)_" if self.tools.dry_run else ""
+            self.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=(
+                f":white_check_mark: <@{user}> applied {', '.join(done)} on `{unit}` (proposed by {by}){dry}"))
+        self.refresh_card(plan)
+        if failed:
+            return "Not applied: " + "; ".join(f"{m}: {e}" for m, e in failed.items())
+        return None
 
     def _send_card(self, channel: str, thread_ts: str | None, plan: Any, text: str,
                    blocks: list[dict[str, Any]], final: bool) -> None:
@@ -522,6 +673,7 @@ class LarreBot:
         actions = self.card_actions(plan, final)
         if chart:
             text = f"{text}\n_{chart[1]}_"
+        note = "\n".join(n for n in (None if final else self.proposal_note(plan), note) if n)
         if note:
             text = f"{text}\n{note}"
         section = [{"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}}]
@@ -547,9 +699,6 @@ class LarreBot:
                                             title=f"LARR-E plan vs measured · {plan.unit}")
             except SlackApiError as exc:
                 log.warning("Plan chart upload failed: %s", exc.response.get("error"))
-
-    def proposed_values(self, unit: str) -> dict[str, float] | None:
-        return None
 
     def post_progress(self, plan: Any, final: bool = False) -> None:
         target = self._update_target(plan)
@@ -734,6 +883,25 @@ class LarreBot:
         @app.action("larre_adjust")
         def on_adjust(ack: Callable, body: dict[str, Any]) -> None:
             ack()  # a link button: Slack opens the URL; the click still needs acknowledging
+
+        def on_card(fn: Callable[..., str | None], pass_action: bool = False) -> Callable[..., None]:
+            def handler(ack: Callable, body: dict[str, Any]) -> None:
+                ack()
+                user, action = body["user"]["id"], body["actions"][0]
+
+                def run_it() -> None:
+                    args = (action["value"], user) + ((action["action_id"],) if pass_action else ())
+                    error = fn(*args)
+                    if error:
+                        self.client.chat_postEphemeral(channel=body["channel"]["id"], user=user, text=error)
+
+                self.submit(run_it)
+
+            return handler
+
+        app.action(re.compile(r"^larre_step_"))(on_card(self.step, pass_action=True))
+        app.action("larre_apply")(on_card(self.apply))
+        app.action("larre_cancel")(on_card(self.cancel))
 
         @app.action("larre_plot_alert")
         def on_plot(ack: Callable, body: dict[str, Any]) -> None:

@@ -86,9 +86,13 @@ class TopicConfig:
     temperature: str = "pioreactor/+/+/temperature_automation/temperature"
     temperature_legacy: str = "pioreactor/+/+/temperature_control/temperature"
     stirring: str = "pioreactor/+/+/stirring/measured_rpm"
+    # Job states, so a deliberate stop or a thermostat start isn't mistaken for a fault.
+    stirring_state: str = "pioreactor/+/+/stirring/$state"
+    temperature_state: str = "pioreactor/+/+/temperature_automation/$state"
 
     def all(self) -> list[str]:
-        return [self.od, self.growth_rate, self.temperature, self.temperature_legacy, self.stirring]
+        return [self.od, self.growth_rate, self.temperature, self.temperature_legacy, self.stirring,
+                self.stirring_state, self.temperature_state]
 
 
 @dataclass(frozen=True)
@@ -154,11 +158,16 @@ class AnomalyConfig:
     temp_drop_c: float = _env_float("LARRE_TEMP_DROP_C", 2.0)
     temp_min_c: float = _env_float("LARRE_TEMP_ALERT_MIN_C", 22.0)
     temp_max_c: float = _env_float("LARRE_TEMP_ALERT_MAX_C", 42.0)
+    # Below temp_min_c is warming up, not a fault, for this long after the thermostat starts.
+    temp_warmup_s: float = _env_float("LARRE_TEMP_WARMUP_S", 1200.0)
     # Growth rate (h^-1): a strongly negative rate means the culture is crashing.
     growth_rate_crash: float = _env_float("LARRE_GR_CRASH", -0.1)
     # Stirring: measured RPM collapsing below this fraction of its baseline.
     stir_stall_fraction: float = _env_float("LARRE_STIR_STALL_FRACTION", 0.3)
     stir_min_baseline_rpm: float = _env_float("LARRE_STIR_MIN_BASELINE_RPM", 200.0)
+    # A stall alert waits this long: stopping stirring on purpose publishes 0 RPM just before the
+    # job's $state becomes "disconnected" (Pioreactor 26.11 stirring.py, base.py).
+    stop_grace_s: float = _env_float("LARRE_STOP_GRACE_S", 5.0)
 
 
 @dataclass(frozen=True)

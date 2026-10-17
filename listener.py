@@ -104,11 +104,76 @@ def parse_message(topic: str, payload: bytes) -> Reading | None:
     return Reading(unit, experiment, metric, float(value), ts, topic)
 
 
+STOPPED_STATES = {"disconnected", "sleeping", "lost"}
+
+
+def parse_job_state(topic: str, payload: bytes) -> tuple[str, str, str] | None:
+    """pioreactor/<unit>/<exp>/<job>/$state -> (unit, job, state), or None."""
+    parts = topic.split("/")
+    if len(parts) != 5 or parts[0] != "pioreactor" or parts[4] != "$state" or not payload:
+        return None
+    try:
+        return parts[1], parts[3], payload.decode().strip()
+    except UnicodeDecodeError:
+        return None
+
+
+class JobStates:
+    """Latest $state per (unit, job), as each Pioreactor job publishes it."""
+
+    def __init__(self) -> None:
+        self._states: dict[tuple[str, str], str] = {}
+        self._lock = threading.Lock()
+
+    def update(self, unit: str, job: str, state: str) -> None:
+        with self._lock:
+            self._states[(unit, job)] = state
+
+    def get(self, unit: str, job: str) -> str | None:
+        with self._lock:
+            return self._states.get((unit, job))
+
+
+class StopAwareGate:
+    """Holds stirring-stall alerts for a few seconds before passing them on.
+
+    Stopping stirring on purpose publishes measured_rpm=0 and, a moment later, $state
+    "disconnected". A real stall publishes 0 while the job stays "ready". Other alerts pass
+    straight through.
+    """
+
+    def __init__(self, jobs: JobStates, emit, grace_s: float, schedule=None):
+        self.jobs, self.emit, self.grace_s = jobs, emit, grace_s
+        self.schedule = schedule or self._timer
+
+    @staticmethod
+    def _timer(delay: float, fn) -> None:
+        t = threading.Timer(delay, fn)
+        t.daemon = True
+        t.start()
+
+    def submit(self, alert: "Alert") -> None:
+        if alert.metric != "stirring":
+            self.emit(alert)
+            return
+        self.schedule(self.grace_s, lambda: self._release(alert))
+
+    def _release(self, alert: "Alert") -> None:
+        if self.jobs.get(alert.unit, "stirring") in STOPPED_STATES:
+            log.info("No stall alert on %s: stirring was stopped on purpose.", alert.unit)
+            return
+        self.emit(alert)
+
+
 class AnomalyDetector:
     """Rolling-window rules per (unit, metric). Thread-safe enough for paho's single network thread."""
 
-    def __init__(self, cfg: Settings = default_settings):
+    def __init__(self, cfg: Settings = default_settings, clock=time.monotonic):
         self.cfg = cfg.anomaly
+        self.clock = clock
+        # Heater warm-up per unit: when the first reading came in, and whether it has reached the band.
+        self.warm_since: dict[str, float] = {}
+        self.warmed: set[str] = set()
         self.windows: dict[tuple[str, str], deque[float]] = defaultdict(
             lambda: deque(maxlen=self.cfg.window_size)
         )
@@ -123,7 +188,7 @@ class AnomalyDetector:
         if verdict is None:
             return None
 
-        now = time.monotonic()
+        now = self.clock()
         if now - self.last_alert.get(key, float("-inf")) < self.cfg.cooldown_s:
             return None
         self.last_alert[key] = now
@@ -141,6 +206,12 @@ class AnomalyDetector:
             topic=r.topic,
         )
 
+    def job_started(self, unit: str, job: str) -> None:
+        """A job reported "ready". A (re)started thermostat gets a fresh warm-up allowance."""
+        if job == "temperature_automation":
+            self.warm_since.pop(unit, None)
+            self.warmed.discard(unit)
+
     def _evaluate(self, r: Reading, baseline: float | None) -> tuple[str, str] | None:
         c, v = self.cfg, r.value
 
@@ -150,17 +221,24 @@ class AnomalyDetector:
             delta = v - baseline
             if delta > max(c.od_spike_abs, c.od_spike_rel * baseline):
                 return "critical", (
-                    f"OD spike on {r.metric}: {v:.3f} vs rolling median {baseline:.3f} "
-                    f"(+{delta / baseline:.0%}). Possible bubble, foam, clump or contamination."
+                    f"OD spike on {r.metric}: {v:.3f} vs rolling median {baseline:.3f}"
+                    f"{f' (+{delta / baseline:.0%})' if baseline else ''}. "
+                    "Possible bubble, foam, clump or contamination."
                 )
             if -delta > max(c.od_spike_abs, c.od_drop_rel * baseline):
                 return "warning", (
-                    f"OD drop on {r.metric}: {v:.3f} vs rolling median {baseline:.3f} "
-                    f"({delta / baseline:.0%}). Possible washout, vial moved, or sensor fault."
+                    f"OD drop on {r.metric}: {v:.3f} vs rolling median {baseline:.3f}"
+                    f"{f' ({delta / baseline:.0%})' if baseline else ''}. "
+                    "Possible washout, vial moved, or sensor fault."
                 )
 
         elif r.metric == "temperature":
-            if not c.temp_min_c <= v <= c.temp_max_c:
+            now = self.clock()
+            started = self.warm_since.setdefault(r.unit, now)
+            if v >= c.temp_min_c:
+                self.warmed.add(r.unit)
+            warming_up = r.unit not in self.warmed and now - started < c.temp_warmup_s
+            if v > c.temp_max_c or (v < c.temp_min_c and not warming_up):
                 return "critical", f"Temperature {v:.2f} °C outside safe band {c.temp_min_c}-{c.temp_max_c} °C."
             if baseline is not None and baseline - v > c.temp_drop_c:
                 return "critical", (
@@ -312,6 +390,42 @@ class AlertSink:
         self._slack(f":brain: *Triage for `{alert['unit']}`*\n{note}")
 
 
+def handle_message(
+    topic: str,
+    payload: bytes,
+    *,
+    state: Any,
+    detector: AnomalyDetector,
+    emit,
+    recorder: Any = None,
+    jobs: JobStates | None = None,
+) -> None:
+    """Process one MQTT message. Never raises: paho stops its loop on an exception from on_message."""
+    try:
+        job_state = parse_job_state(topic, payload)
+        if job_state:
+            unit, job, value = job_state
+            if jobs is not None:
+                jobs.update(unit, job, value)
+            if value == "ready":
+                detector.job_started(unit, job)
+            return
+        reading = parse_message(topic, payload)
+        if reading is None:
+            return
+        state.update(reading)
+        if recorder:
+            try:
+                recorder.record(reading)
+            except Exception:
+                log.exception("Could not record a reading from %s; carrying on.", topic)
+        alert = detector.observe(reading)
+        if alert:
+            emit(alert)
+    except Exception:
+        log.exception("Skipped a message on %s; the listener keeps running.", topic)
+
+
 def build_client(cfg: Settings, role: str = "listener") -> mqtt.Client:
     m = cfg.mqtt
     client = mqtt.Client(
@@ -333,6 +447,8 @@ def run(cfg: Settings = default_settings, auto_triage: bool | None = None) -> No
     state = LiveState(cfg)
     client = build_client(cfg)
     sink = AlertSink(cfg, client, auto_triage)
+    jobs = JobStates()
+    gate = StopAwareGate(jobs, sink.emit, cfg.anomaly.stop_grace_s)
     recorder = Recorder(cfg.pioreactor.db_path) if cfg.pioreactor.record_db else None
     if recorder:
         console.print(f"[cyan]Recording telemetry into {cfg.pioreactor.db_path}[/cyan]")
@@ -351,15 +467,8 @@ def run(cfg: Settings = default_settings, auto_triage: bool | None = None) -> No
         console.print(f"[yellow]MQTT disconnected ({reason_code}); reconnecting…[/yellow]")
 
     def on_message(client, userdata, msg):
-        reading = parse_message(msg.topic, msg.payload)
-        if reading is None:
-            return
-        state.update(reading)
-        if recorder:
-            recorder.record(reading)
-        alert = detector.observe(reading)
-        if alert:
-            sink.emit(alert)
+        handle_message(msg.topic, msg.payload, state=state, detector=detector, emit=gate.submit,
+                       recorder=recorder, jobs=jobs)
 
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect

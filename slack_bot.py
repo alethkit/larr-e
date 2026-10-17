@@ -444,6 +444,20 @@ class LarreBot:
             bits.append(f"growth {s['growth_rate']['value']:.3f} h⁻¹")
         return head + ("\n" + " · ".join(bits) if bits else "\n_(no live telemetry: is `larr-e listen` running?)_")
 
+    def upload_plan_chart(self, channel: str, thread_ts: str | None, plan: Any) -> None:
+        """The plan as a dashed target line with the measured readings over it, as on the /plan page."""
+        try:
+            result = self.tools.plot_plan(plan)
+        except ToolError:
+            return  # the plan sets no temperature or stirring speed
+        off = [f"{m} off target {v:g} min" for m, v in result["off_target_min"].items() if v]
+        caption = f"`{plan.unit}` · {plan.name}: plan vs measured · " + (", ".join(off) or "on target throughout")
+        try:
+            self.client.files_upload_v2(channel=channel, thread_ts=thread_ts, file=result["png_path"],
+                                        title=f"LARR-E plan vs measured · {plan.unit}", initial_comment=caption)
+        except SlackApiError as exc:
+            log.warning("Plan chart upload failed: %s", exc.response.get("error"))
+
     def post_progress(self, plan: Any, final: bool = False) -> None:
         target = self._update_target(plan)
         if not target:
@@ -451,6 +465,7 @@ class LarreBot:
             return
         channel, thread_ts = target
         self.client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=self.progress_text(plan, final))
+        self.upload_plan_chart(channel, thread_ts, plan)
         minutes = max(1.0, min(plan.elapsed_h() or 0.0, plan.duration_h) * 60)
         for metrics in (["od", "growth_rate"], ["od", "temperature"]):
             try:

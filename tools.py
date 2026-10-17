@@ -703,6 +703,48 @@ class PioreactorTools:
                 result["pearson_r"] = round(float(np.corrcoef(y0, y1_on_x0)[0, 1]), 3)
         return result
 
+    def plot_plan(self, plan: ExperimentPlan) -> dict[str, Any]:
+        """PNG of the plan against what happened: one panel per setpoint (temperature, stirring) with
+        the target as a dashed line and off-target stretches shaded. The /plan page draws the same."""
+        from matplotlib.figure import Figure
+
+        start = parse_timestamp(plan.started_at).timestamp() if plan.started_at else time.time()
+        elapsed_min = max(1.0, min((time.time() - start) / 60, plan.duration_h * 60))
+        metrics = [m for m in ("temperature", "stirring") if plan.target(m) is not None]
+        if not metrics:
+            raise ToolError("The plan sets no temperature or stirring speed to compare against.")
+
+        fig = Figure(figsize=(10, 2.4 * len(metrics) + 0.6), dpi=120)
+        axes = fig.subplots(len(metrics), 1, sharex=True, squeeze=False)[:, 0]
+        end_min = plan.duration_h * 60
+        off_target_min: dict[str, float] = {}
+        for ax, metric in zip(axes, metrics):
+            s, _ = self.get_series(metric, plan.unit, elapsed_min + 1)
+            t_min = [(t.timestamp() - start) / 60 for t in s.timestamps]
+            target = plan.target(metric)
+            off = 0.0
+            for i, (t, v) in enumerate(zip(t_min, s.values)):
+                if plan.off_target(metric, t * 60, v):
+                    nxt = t_min[i + 1] if i + 1 < len(t_min) else t + 10 / 60
+                    ax.axvspan(t, nxt, color="#fed7aa", lw=0)
+                    off += nxt - t
+            off_target_min[metric] = round(off, 1)
+            ax.hlines(target, 0, end_min, colors="#0f766e", linestyles="dashed", lw=2, label="target (plan)")
+            if s.values:
+                ax.plot(t_min, s.values, color="#1c2421", lw=1.5, label="measured")
+            ax.axvline(min((time.time() - start) / 60, end_min), color="#6b7570", ls=":", lw=1)
+            ax.set_ylabel(METRIC_LABELS[metric])
+            ax.grid(alpha=0.3)
+        axes[0].legend(loc="lower right", fontsize=8)
+        axes[0].set_title(f"LARR-E · {plan.name} on {plan.unit}: plan vs measured")
+        axes[-1].set_xlabel("minutes since the plan started (dashed = target, shaded = off target)")
+        axes[-1].set_xlim(-0.02 * end_min, end_min * 1.02)
+        fig.tight_layout()
+        out = self.cfg.output.plots_dir / f"{plan.unit}_plan_{int(time.time())}.png"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out)
+        return {"unit": plan.unit, "png_path": str(out), "off_target_min": off_target_min}
+
     # ------------------------------------------------------------------ live state
 
     def _live_state(self) -> dict[str, Any]:

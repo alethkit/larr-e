@@ -177,5 +177,7 @@ uv run larr-e listen --no-triage    # terminal 1: telemetry, alerts, recorder
 uv run larr-e status                # live table, no LLM
 uv run larr-e exec "…"              # asks before touching hardware
 uv run larr-e twin --units twin1,twin2 --experiment larre-twin --mqtt-host pioreactor.local --port 8790
+#   the twin's thermostat runs at real speed (a reading every 225 s, ~25 min to 37 °C); add
+#   --temp-speed 10 for a stage demo. Gaps from a real Pioreactor: docs/twin-fidelity.md
 uv run --group dev pytest           # ~55 s; the twin test needs mosquitto or amqtt (dev group)
 ```

@@ -8,7 +8,16 @@ recorded in `runtime/cluster.sqlite`: 357 stirring readings, 24 temperatures and
 
 Ranked by how much each gap could make LARR-E look better on the twin than it would on the real reactor.
 
-## 1. Temperature: far too fast, far too often
+## 1. Temperature: far too fast, far too often (fixed 18 Oct)
+
+**Fixed:** readings now come every 225 s (one as the thermostat starts), the warm-up time constant
+is 12 min (from pio01's first heat-up), and targets are clamped at 63 °C. `--temp-speed 10` runs the
+thermostat 10× faster for a stage demo. Tests: `tests/test_twin_temperature.py`. Not modelled: the
+PID's own dynamics, and the heater pausing during each reading. Passive cooling (10 min) is not
+measured on pio01. pio01's third heat-up fitted a slower 23 min time constant, so real warm-ups can
+take longer than the twin's.
+
+The comparison before the fix:
 
 | | Real (26.11, 20 ml v1.0) | Twin today |
 |---|---|---|
